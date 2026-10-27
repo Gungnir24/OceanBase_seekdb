@@ -378,19 +378,34 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+namespace {
+// Byte-wise comparison of two words. For CS_TYPE_UTF8MB4_BIN this is exactly
+// the ordering of ObCharset::strcmp, but without the per-call collation
+// lookup, argument validation and indirect call.
+inline int ft_word_compare(const ObString &lhs, const ObString &rhs)
+{
+  const int64_t lhs_len = lhs.length();
+  const int64_t rhs_len = rhs.length();
+  const int64_t cmp_len = MIN(lhs_len, rhs_len);
+  int cmp = (cmp_len > 0) ? memcmp(lhs.ptr(), rhs.ptr(), static_cast<size_t>(cmp_len)) : 0;
+  if (0 == cmp) {
+    if (lhs_len < rhs_len) {
+      cmp = -1;
+    } else if (lhs_len > rhs_len) {
+      cmp = 1;
+    }
+  }
+  return cmp;
+}
+} // namespace
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
   bool found = false;
   for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
+    if (ft_word_compare(range_dicts_[i].start_.get_word(), single_word) <= 0
+        && ft_word_compare(range_dicts_[i].end_.get_word(), single_word) >= 0) {
       dict = range_dicts_[i].dict_;
       found = true;
     }

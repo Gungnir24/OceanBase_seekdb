@@ -174,6 +174,16 @@ public:
                      const ObDATrieHit &last_hit,
                      ObDATrieHit &hit) const;
 
+  // Resolve the code of a single word (no trie walk). Propagates
+  // OB_ENTRY_NOT_EXIST when the word is not in the map.
+  int get_word_code(const ObString &single_word, ObFTWordCode &code) const;
+
+  // Match single word with hit, reusing an already resolved code.
+  int match_with_hit_with_code(const ObString &single_word,
+                               const ObFTWordCode code,
+                               const ObDATrieHit &last_hit,
+                               ObDATrieHit &hit) const;
+
 private:
   ObFTDAT *dat_;
 

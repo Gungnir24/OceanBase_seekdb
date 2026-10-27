@@ -17,14 +17,18 @@
 #ifndef _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 #define _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 
+#include "lib/allocator/page_arena.h"
+#include "lib/atomic/ob_atomic.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/lock/ob_bucket_lock.h"
+#include "lib/lock/ob_spin_rwlock.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
 
 namespace oceanbase
 {
 namespace storage
 {
+class ObIFTDict;
 // typedef uint64_t ObFTTableID;
 // typedef ObFTTableID ObFTDictTableID;
 
@@ -96,7 +100,18 @@ class ObFTCacheRangeContainer;
 class ObFTDictHub
 {
 public:
-  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_() {}
+  ObFTDictHub()
+      : is_inited_(false),
+        dict_map_(),
+        rw_dict_lock_(),
+        shared_lock_(),
+        shared_dict_alloc_(lib::ObMemAttr("FTDictShared")),
+        shared_ready_(false),
+        shared_main_dict_(nullptr),
+        shared_quan_dict_(nullptr),
+        shared_stop_dict_(nullptr)
+  {
+  }
   ~ObFTDictHub() {}
 
   int init();
@@ -107,17 +122,39 @@ public:
 
   int load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
 
+  // Get the shared IK dictionary set.
+  //
+  // The built-in IK dictionaries are immutable once their DAT blocks are put
+  // into the dict cache, so they can be shared by all tokenizer instances
+  // instead of being re-fetched (and re-assembled into range dicts) for every
+  // single parse call. The set is materialized on first use and afterwards the
+  // hot path is a single atomic load.
+  int get_ik_dicts(ObIFTDict *&main_dict, ObIFTDict *&quan_dict, ObIFTDict *&stop_dict);
+
 private:
   int get_dict_info(const ObFTDictInfoKey &key, ObFTDictInfo &info);
 
   int put_dict_info(const ObFTDictInfoKey &key, const ObFTDictInfo &info);
 
+  int build_shared_ik_dicts();
+
+  int build_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict);
 
 private:
   bool is_inited_;
   // holds info of dict
   hash::ObHashMap<ObFTDictInfoKey, ObFTDictInfo> dict_map_;
   ObBucketLock rw_dict_lock_;
+
+  // shared (built once, read-only afterwards) IK dictionary set
+  common::SpinRWLock shared_lock_;
+  common::ObArenaAllocator shared_dict_alloc_;
+  bool shared_ready_;
+  ObIFTDict *shared_main_dict_;
+  ObIFTDict *shared_quan_dict_;
+  ObIFTDict *shared_stop_dict_;
+
+  DISALLOW_COPY_AND_ASSIGN(ObFTDictHub);
 };
 
 } //  namespace storage
