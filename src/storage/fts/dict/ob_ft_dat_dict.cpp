@@ -247,49 +247,69 @@ int ObFTDATBuilder<DATA_TYPE>::encode(const ObString &word, ObFTWordCode &code, 
 }
 
 template <typename DATA_TYPE>
+int ObFTDATReader<DATA_TYPE>::get_word_code(const ObString &ft_char, ObFTWordCode &code) const
+{
+  int ret = OB_SUCCESS;
+  ObFTSingleWord word;
+  word.set_word(ft_char.ptr(), ft_char.length());
+  // OB_ENTRY_NOT_EXIST is propagated on purpose: the caller decides whether a
+  // missing word merely means "this hit is dead".
+  ret = dat_->get_map()->find(word, code);
+  return ret;
+}
+
+template <typename DATA_TYPE>
 int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
                                              const ObDATrieHit &last_hit,
                                              ObDATrieHit &hit) const
 {
   int ret = OB_SUCCESS;
-  ObFTWordCode code;
+  ObFTWordCode code = 0;
+  if (OB_FAIL(get_word_code(ft_char, code))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+      hit.set_unmatch();
+    }
+  } else if (OB_FAIL(match_with_hit_with_code(ft_char, code, last_hit, hit))) {
+  }
+  return ret;
+}
+
+template <typename DATA_TYPE>
+int ObFTDATReader<DATA_TYPE>::match_with_hit_with_code(const ObString &ft_char,
+                                                       const ObFTWordCode code,
+                                                       const ObDATrieHit &last_hit,
+                                                       ObDATrieHit &hit) const
+{
+  int ret = OB_SUCCESS;
   hit.set_unmatch();
-  auto *map = dat_->get_map();
   int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
   int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
 
-  ObFTSingleWord word;
-  word.set_word(ft_char.ptr(), ft_char.length());
-  if (OB_FAIL(dat_->get_map()->find(word, code)) && OB_ENTRY_NOT_EXIST != ret) {
-  } else if (OB_ENTRY_NOT_EXIST == ret) {
-    ret = OB_SUCCESS;
-    hit.set_unmatch();
+  if (&last_hit == &hit) {
+    // sameone
   } else {
-    if (&last_hit == &hit) {
-      // sameone
-    } else {
-      hit = last_hit;
-    }
-    if (0 == hit.base_idx_) {
-      hit.base_idx_ = 1; // from current to do check;
-    }
-    // from current place to do check
-    int32_t idx = abs(base[hit.base_idx_]) + code;
+    hit = last_hit;
+  }
+  if (0 == hit.base_idx_) {
+    hit.base_idx_ = 1; // from current to do check;
+  }
+  // from current place to do check
+  int32_t idx = abs(base[hit.base_idx_]) + code;
 
-    if (check[idx] != hit.base_idx_) {
-      hit.set_unmatch();
-    } else if (base[idx] < 0) {
-      hit.base_idx_ = idx;
-      hit.end_pos_ = hit.end_pos_ + ft_char.length();
-      hit.char_cnt_++;
-      hit.set_match();
-      hit.set_prefix(); // to be checked next time
-    } else {
-      hit.base_idx_ = idx;
-      hit.end_pos_ = hit.end_pos_ + ft_char.length();
-      hit.char_cnt_++;
-      hit.set_prefix();
-    }
+  if (check[idx] != hit.base_idx_) {
+    hit.set_unmatch();
+  } else if (base[idx] < 0) {
+    hit.base_idx_ = idx;
+    hit.end_pos_ = hit.end_pos_ + ft_char.length();
+    hit.char_cnt_++;
+    hit.set_match();
+    hit.set_prefix(); // to be checked next time
+  } else {
+    hit.base_idx_ = idx;
+    hit.end_pos_ = hit.end_pos_ + ft_char.length();
+    hit.char_cnt_++;
+    hit.set_prefix();
   }
   return ret;
 }
@@ -299,18 +319,34 @@ template class ObFTDATReader<void>;
 
 ObArrayHashMap *ObFTDAT::get_map() { return reinterpret_cast<ObArrayHashMap *>(buff); }
 
+namespace {
+// A tiny, always inlined hash for fulltext words. Words hold at most
+// ObCharset::MAX_MB_LEN bytes, so the loop is fully unrolled by the compiler.
+// Using a local FNV-1a keeps the hot lookup path free of the out-of-line
+// murmurhash call and of the ObString wrapper construction.
+inline uint64_t ft_single_word_hash(const char *word, uint8_t word_len)
+{
+  uint64_t hash = 0xcbf29ce484222325ULL;
+  for (uint8_t i = 0; i < word_len; ++i) {
+    hash ^= static_cast<unsigned char>(word[i]);
+    hash *= 0x100000001b3ULL;
+  }
+  return hash;
+}
+} // namespace
+
 int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
 {
   int ret = OB_ENTRY_NOT_EXIST;
-  uint64_t hash = word.get_word().hash();
-  uint64_t index = hash % header_.capacity_;
+  const uint64_t mask = header_.capacity_ - 1;
+  uint64_t index = ft_single_word_hash(word.word, word.word_len) & mask;
   while (header_.data[index].used) {
     if (header_.data[index].word == word) {
       code = header_.data[index].code;
       ret = OB_SUCCESS;
       break;
     } else {
-      index = (index + 3) % header_.capacity_;
+      index = (index + 3) & mask;
     }
   }
   return ret;
@@ -319,10 +355,10 @@ int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
 int ObArrayHashMap::insert(const ObString &key, ObFTWordCode code)
 {
   int ret = OB_SUCCESS;
-  uint64_t hash = key.hash();
-  uint64_t index = hash % header_.capacity_;
+  const uint64_t mask = header_.capacity_ - 1;
+  uint64_t index = ft_single_word_hash(key.ptr(), static_cast<uint8_t>(key.length())) & mask;
   while (header_.data[index].used) {
-    index = (index + 3) % header_.capacity_;
+    index = (index + 3) & mask;
   }
 
   header_.data[index].code = code;
@@ -354,9 +390,16 @@ size_t ObArrayHashMap::estimate_size(size_t word_num)
 
 size_t ObArrayHashMap::estimate_capacity(size_t word_num)
 {
-  constexpr size_t MIN_CAPACITY = 101;                   // prime
+  constexpr size_t MIN_CAPACITY = 128;
   size_t capacity = MAX(word_num * 4 / 3, MIN_CAPACITY); // 75%
-  return capacity;
+  // The lookup path indexes with a mask, so the capacity must be a power of
+  // two. The probe step (3) is co-prime with any power of two, therefore the
+  // probe sequence still covers the whole table.
+  size_t pow2_capacity = MIN_CAPACITY;
+  while (pow2_capacity < capacity) {
+    pow2_capacity <<= 1;
+  }
+  return pow2_capacity;
 }
 } //  namespace storage
 } //  namespace oceanbase

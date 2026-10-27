@@ -123,6 +123,31 @@ public:
   virtual int match_with_hit(const ObString &single_word,
                              const ObDATrieHit &last_hit,
                              ObDATrieHit &hit) const = 0;
+
+  // Resolve the trie code of a single word without walking the trie.
+  // OB_SUCCESS with code when the word exists, OB_ENTRY_NOT_EXIST when it does
+  // not, OB_NOT_SUPPORTED when the dict cannot provide the code. Callers that
+  // advance several pending hits over the very same character can resolve the
+  // code once and reuse it for every hit.
+  // NOTE: ObFTWordCode is int32_t (see ob_ft_dict_def.h); using the underlying
+  // type here keeps this header free of a dict_def.h dependency.
+  virtual int get_word_code(const ObString &single_word, int32_t &code) const
+  {
+    UNUSED(single_word);
+    UNUSED(code);
+    return OB_NOT_SUPPORTED;
+  }
+
+  // Same as the three argument match_with_hit(), but with an already resolved
+  // word code. The default implementation ignores the hint and falls back.
+  virtual int match_with_hit(const ObString &single_word,
+                             const int32_t code,
+                             const ObDATrieHit &last_hit,
+                             ObDATrieHit &hit) const
+  {
+    UNUSED(code);
+    return match_with_hit(single_word, last_hit, hit);
+  }
 };
 
 } // namespace storage

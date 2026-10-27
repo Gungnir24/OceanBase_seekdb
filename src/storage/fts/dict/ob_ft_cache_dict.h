@@ -43,6 +43,11 @@ public:
   int match_with_hit(const ObString &single_word,
                      const ObDATrieHit &last_hit,
                      ObDATrieHit &hit) const override;
+  int get_word_code(const ObString &single_word, int32_t &code) const override;
+  int match_with_hit(const ObString &single_word,
+                     const int32_t code,
+                     const ObDATrieHit &last_hit,
+                     ObDATrieHit &hit) const override;
 
 public:
   static int make_and_fetch_cache_entry(const ObFTDictDesc &desc,

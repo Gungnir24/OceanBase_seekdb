@@ -58,14 +58,14 @@ public:
   void init(const int64_t size) { MEMSET(data_, 0, memory_size(size)); }
   void reset(const int64_t size) { init(size); }
 
-  inline bool at(const int64_t idx) const;
+  OB_INLINE bool at(const int64_t idx) const;
   bool contain(const int64_t idx) const { return at(idx); }
   bool exist(const int64_t idx) const { return at(idx); }
   void deep_copy(const ObBitVectorImpl<WordType> &src, const int64_t size)
   {
     MEMCPY(data_, src.data_, byte_count(size));
   }
-  inline void set(const int64_t idx);
+  OB_INLINE void set(const int64_t idx);
   OB_INLINE void atomic_set(const int64_t idx);
   inline void unset(const int64_t idx);
   OB_INLINE WordType *align_at(const int64_t idx)
@@ -224,7 +224,7 @@ inline int64_t ObBitVectorImpl<WordType>::memory_size(const int64_t size)
 }
 
 template<typename WordType>
-inline bool ObBitVectorImpl<WordType>::at(const int64_t idx) const
+OB_INLINE bool ObBitVectorImpl<WordType>::at(const int64_t idx) const
 {
   OB_ASSERT(idx >= 0);
   // The modern compiler is smart enough to optimize this division to bit operations.
@@ -240,7 +240,7 @@ inline void ObBitVectorImpl<WordType>::bit_or_assign(const int64_t idx, const bo
 }
 
 template<typename WordType>
-inline void ObBitVectorImpl<WordType>::set(const int64_t idx)
+OB_INLINE void ObBitVectorImpl<WordType>::set(const int64_t idx)
 {
   OB_ASSERT(idx >= 0);
   data_[idx / WORD_BITS] |= static_cast<WordType>(1) << (idx % WORD_BITS);

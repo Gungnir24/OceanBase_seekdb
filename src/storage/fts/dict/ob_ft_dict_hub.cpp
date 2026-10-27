@@ -22,8 +22,9 @@
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "storage/fts/dict/ob_ft_cache_container.h"
-#include "storage/fts/dict/ob_ft_dict_def.h"
+#include "storage/fts/dict/ob_ft_dict.h"
 #include "storage/fts/dict/ob_ft_range_dict.h"
+#include "storage/fts/dict/ob_ft_dict_def.h"
 namespace oceanbase
 {
 namespace storage
@@ -44,6 +45,109 @@ int ObFTDictHub::destroy()
 {
   int ret = OB_SUCCESS;
   is_inited_ = false;
+  ATOMIC_STORE(&shared_ready_, false);
+  if (OB_NOT_NULL(shared_main_dict_)) {
+    shared_main_dict_->~ObIFTDict();
+    shared_main_dict_ = nullptr;
+  }
+  if (OB_NOT_NULL(shared_quan_dict_)) {
+    shared_quan_dict_->~ObIFTDict();
+    shared_quan_dict_ = nullptr;
+  }
+  if (OB_NOT_NULL(shared_stop_dict_)) {
+    shared_stop_dict_->~ObIFTDict();
+    shared_stop_dict_ = nullptr;
+  }
+  shared_dict_alloc_.reset();
+  return ret;
+}
+
+int ObFTDictHub::build_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
+{
+  int ret = OB_SUCCESS;
+  ObFTCacheRangeContainer *container = nullptr;
+  ObFTRangeDict *range_dict = nullptr;
+  if (OB_ISNULL(container = OB_NEWx(ObFTCacheRangeContainer, &shared_dict_alloc_,
+                                    shared_dict_alloc_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    STORAGE_FTS_LOG(WARN, "failed to allocate dict cache container", K(ret), "dict_type", desc.type_);
+  } else if (OB_FAIL(load_cache(desc, *container))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      // The dictionary is not resident in the dict cache yet, build it from
+      // the built-in dictionary text. This is the expensive path and it only
+      // runs once per process.
+      if (OB_FAIL(build_cache(desc, *container))) {
+        STORAGE_FTS_LOG(WARN, "failed to build dict cache", K(ret), "dict_type", desc.type_);
+      }
+    } else {
+      STORAGE_FTS_LOG(WARN, "failed to load dict cache", K(ret), "dict_type", desc.type_);
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(range_dict = OB_NEWx(ObFTRangeDict, &shared_dict_alloc_,
+                                            shared_dict_alloc_, container, desc))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    STORAGE_FTS_LOG(WARN, "failed to allocate range dict", K(ret), "dict_type", desc.type_);
+  } else if (OB_FAIL(range_dict->init())) {
+    STORAGE_FTS_LOG(WARN, "failed to init range dict", K(ret), "dict_type", desc.type_);
+  } else {
+    dict = range_dict;
+  }
+  return ret;
+}
+
+int ObFTDictHub::build_shared_ik_dicts()
+{
+  int ret = OB_SUCCESS;
+  const ObFTDictDesc main_dict_desc("main_dict",
+                                    ObFTDictType::DICT_IK_MAIN,
+                                    ObCharsetType::CHARSET_UTF8MB4,
+                                    ObCollationType::CS_TYPE_UTF8MB4_BIN);
+  const ObFTDictDesc quan_dict_desc("quan_dict",
+                                    ObFTDictType::DICT_IK_QUAN,
+                                    ObCharsetType::CHARSET_UTF8MB4,
+                                    ObCollationType::CS_TYPE_UTF8MB4_BIN);
+  const ObFTDictDesc stopword_dict_desc("stopword",
+                                        ObFTDictType::DICT_IK_STOP,
+                                        ObCharsetType::CHARSET_UTF8MB4,
+                                        ObCollationType::CS_TYPE_UTF8MB4_BIN);
+  if (OB_FAIL(build_shared_dict(main_dict_desc, shared_main_dict_))) {
+  } else if (OB_FAIL(build_shared_dict(quan_dict_desc, shared_quan_dict_))) {
+  } else if (OB_FAIL(build_shared_dict(stopword_dict_desc, shared_stop_dict_))) {
+  }
+  return ret;
+}
+
+int ObFTDictHub::get_ik_dicts(ObIFTDict *&main_dict,
+                              ObIFTDict *&quan_dict,
+                              ObIFTDict *&stop_dict)
+{
+  int ret = OB_SUCCESS;
+  main_dict = nullptr;
+  quan_dict = nullptr;
+  stop_dict = nullptr;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_LIKELY(ATOMIC_LOAD(&shared_ready_))) {
+    // hot path: the dictionary set is immutable after being published
+    main_dict = shared_main_dict_;
+    quan_dict = shared_quan_dict_;
+    stop_dict = shared_stop_dict_;
+  } else {
+    common::SpinWLockGuard guard(shared_lock_);
+    if (ATOMIC_LOAD(&shared_ready_)) {
+      main_dict = shared_main_dict_;
+      quan_dict = shared_quan_dict_;
+      stop_dict = shared_stop_dict_;
+    } else if (OB_FAIL(build_shared_ik_dicts())) {
+      STORAGE_FTS_LOG(WARN, "failed to build shared ik dicts", K(ret));
+    } else {
+      ATOMIC_STORE(&shared_ready_, true);
+      main_dict = shared_main_dict_;
+      quan_dict = shared_quan_dict_;
+      stop_dict = shared_stop_dict_;
+    }
+  }
   return ret;
 }
 int ObFTDictHub::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container)

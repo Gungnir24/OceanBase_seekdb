@@ -387,7 +387,29 @@ struct ObDatumStrCmp : public ObDefined<SupportedCollection<CS_TYPE>::defined_>
 {
   inline static int cmp(const ObDatum &l, const ObDatum &r, int &cmp_ret)
   {
+    // Fast path for the common case: resolve the collation handler once per
+    // instantiation instead of on every comparison, so the hot path is a
+    // single indirect call into the collation routine.
+    const ObCharsetInfo *cs_info = get_cs_info();
+    if (OB_LIKELY(NULL != cs_info) && OB_LIKELY(NULL != cs_info->coll->strnncollsp)
+        && OB_LIKELY(NULL != l.ptr_) && OB_LIKELY(NULL != r.ptr_)) {
+      cmp_ret = cs_info->coll->strnncollsp(cs_info,
+                                           reinterpret_cast<const unsigned char *>(l.ptr_),
+                                           static_cast<size_t>(l.len_),
+                                           reinterpret_cast<const unsigned char *>(r.ptr_),
+                                           static_cast<size_t>(r.len_),
+                                           WITH_END_SPACE);
+      cmp_ret = cmp_ret > 0 ? 1 : (cmp_ret < 0 ? -1 : 0);
+      return OB_SUCCESS;
+    }
     return ObDatumStrCmpImpl::cmp(l, r, cmp_ret, CS_TYPE, WITH_END_SPACE);
+  }
+
+private:
+  static const ObCharsetInfo *get_cs_info()
+  {
+    static const ObCharsetInfo *cs_info = ObCharset::get_charset(CS_TYPE);
+    return cs_info;
   }
 };
 
