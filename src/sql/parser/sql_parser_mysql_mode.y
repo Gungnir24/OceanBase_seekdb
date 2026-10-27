@@ -497,7 +497,7 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
-%type <node> json_table_expr unnest_expr file_table_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
+%type <node> json_table_expr unnest_expr file_table_expr copy_stmt copy_format_opt_list copy_option_seq copy_option mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -556,6 +556,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -8900,6 +8901,63 @@ LIMIT limit_expr OFFSET limit_expr
   // setup_token_pos_info($$, @1.first_column - 1, @4.last_column - @1.first_column + 1);
   check_ret(setup_token_pos_info_and_dup_string($$, result, @1.first_column, @4.last_column),
             &@1, result);
+}
+;
+
+copy_stmt:
+COPY '(' select_stmt ')' TO STRING_VALUE copy_format_opt_list
+{
+  ParseNode *into_node = NULL;
+  malloc_non_terminal_node(into_node, result->malloc_pool_, T_INTO_OUTFILE, 3, $6, $7, NULL);
+  $$ = $3;
+  $$->children_[PARSE_SELECT_INTO_EXTRA] = into_node;
+}
+;
+
+copy_format_opt_list:
+/* EMPTY */
+{
+  $$ = NULL;
+}
+| '(' copy_option_seq ')'
+{
+  ParseNode *format_list = NULL;
+  merge_nodes(format_list, result, T_EXTERNAL_FILE_FORMAT, $2);
+  $$ = format_list;
+}
+;
+
+copy_option_seq:
+copy_option
+{
+  $$ = $1;
+}
+| copy_option_seq ',' copy_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+copy_option:
+NAME_OB
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_COPY_OPTION, 2, $1, NULL);
+}
+| FORMAT NAME_OB
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_COPY_OPTION, 2, NULL, $2);
+}
+| FORMAT STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_COPY_OPTION, 2, NULL, $2);
+}
+| NAME_OB NAME_OB
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_COPY_OPTION, 2, $1, $2);
+}
+| NAME_OB STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_COPY_OPTION, 2, $1, $2);
 }
 ;
 
