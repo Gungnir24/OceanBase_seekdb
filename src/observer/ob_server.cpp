@@ -2399,7 +2399,6 @@ int ObServer::init_sql()
                                              ObSQLSessionMgr::SCHEDULE_PERIOD, true))) {
   } else {
     LOG_INFO("init sql session mgr done");
-    LOG_INFO("init sql location cache done");
   }
 
   if (OB_SUCC(ret)) {
