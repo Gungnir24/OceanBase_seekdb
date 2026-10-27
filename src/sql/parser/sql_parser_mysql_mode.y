@@ -497,7 +497,7 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
-%type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
+%type <node> json_table_expr unnest_expr file_table_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -10844,6 +10844,10 @@ tbl_name
 {
   $$ = $1;
 }
+| file_table_expr
+{
+  $$ = $1;
+}
 | hybrid_search_expr
 {
   $$ = $1;
@@ -17479,6 +17483,44 @@ literal
 }
 ;
 
+file_table_expr:
+NAME_OB '(' expr_list ')'
+{
+  /* File table arguments are consumed by the resolver, keep them as literals so
+     the argument values stay visible in the parse tree. */
+  $3->is_tree_not_param_ = true;
+  for (int64_t arg_idx = 0; arg_idx < $3->num_child_; ++arg_idx) {
+    if (NULL != $3->children_[arg_idx]) {
+      $3->children_[arg_idx]->is_tree_not_param_ = true;
+    }
+  }
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, NULL);
+}
+| NAME_OB '(' expr_list ')' relation_name
+{
+  /* File table arguments are consumed by the resolver, keep them as literals so
+     the argument values stay visible in the parse tree. */
+  $3->is_tree_not_param_ = true;
+  for (int64_t arg_idx = 0; arg_idx < $3->num_child_; ++arg_idx) {
+    if (NULL != $3->children_[arg_idx]) {
+      $3->children_[arg_idx]->is_tree_not_param_ = true;
+    }
+  }
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $5);
+}
+| NAME_OB '(' expr_list ')' AS relation_name
+{
+  /* File table arguments are consumed by the resolver, keep them as literals so
+     the argument values stay visible in the parse tree. */
+  $3->is_tree_not_param_ = true;
+  for (int64_t arg_idx = 0; arg_idx < $3->num_child_; ++arg_idx) {
+    if (NULL != $3->children_[arg_idx]) {
+      $3->children_[arg_idx]->is_tree_not_param_ = true;
+    }
+  }
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $6);
+}
+;
 unreserved_keyword:
 unreserved_keyword_for_role_name { $$=$1;}
 | unreserved_keyword_ambiguous_roles { $$=$1;}

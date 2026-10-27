@@ -129,6 +129,12 @@ public:
   // Validate compatibility selectors such as TENANT = sys after TENANT was
   // removed as a global keyword in the standalone runtime.
   static int resolve_local_runtime_selector(const ParseNode *runtime_selector);
+  // File table functions: read_csv, read_json, read_parquet and glob.
+  static int is_file_table_function(const ParseNode &node, bool &is_file_table);
+  static const ParseNode *find_file_table_node(const ParseNode &node);
+  static int build_file_table_select_sql(const ParseNode &file_table_node, ObSqlString &sql);
+  static int build_file_describe_sql(const ParseNode &file_table_node, ObSqlString &sql);
+  static int check_file_sql_enabled(ObSQLSessionInfo *session_info, bool &enabled);
   static int get_user_type(common::ObIAllocator *allocator,
                            ObSQLSessionInfo *session_info,
                            ObPlanCache *plan_cache,

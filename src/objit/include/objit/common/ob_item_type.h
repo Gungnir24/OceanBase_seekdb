@@ -2270,6 +2270,7 @@ typedef enum ObItemType
   T_FUN_ES_SCORE = 4913, // fulltext index for ES SQL
   T_FUN_ES_MATCH = 4914, // fulltext index for ES SQL
   T_HYBRID_SEARCH_EXPRESSION = 4915,
+  T_FILE_TABLE_EXPRESSION = 4921,
   T_FORK_TABLE = 4916,
   T_FORK_DATABASE = 4917,
   T_DIFF_TABLE = 4918,

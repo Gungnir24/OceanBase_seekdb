@@ -41,6 +41,19 @@
 #include "sql/engine/expr/ob_expr_cast.h"
 #include "sql/pl/ob_pl_dependency_util.h"
 #include "data_plane/transaction/ob_xa_id.h"
+#include <vector>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <cstdio>
+#include <cerrno>
+#include <cstdlib>
+#include <cctype>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <dirent.h>
+#endif
 
 namespace oceanbase
 {
@@ -7379,6 +7392,1825 @@ int ObResolverUtils::collect_and_validate_columns(const ObTableSchema *cur_schem
     LOG_USER_ERROR(OB_NOT_SUPPORTED, no_pk_msg);
   }
 
+  return ret;
+}
+
+namespace file_sql_internal
+{
+
+enum FileColType
+{
+  FCT_VARCHAR = 0,
+  FCT_BOOLEAN,
+  FCT_BIGINT,
+  FCT_DOUBLE,
+  FCT_DATE,
+  FCT_DATETIME
+};
+
+struct FileTableSchema
+{
+  std::vector<std::string> names_;
+  std::vector<FileColType> types_;
+  std::vector<bool> nullable_;
+  FileTableSchema() {}
+};
+
+struct FileTableData
+{
+  FileTableSchema schema_;
+  std::vector<std::vector<std::string>> rows_;
+  std::vector<std::vector<char>> nulls_;  // 1 means SQL NULL
+  FileTableData() {}
+};
+
+static const char *file_col_type_name(const FileColType type)
+{
+  const char *name = "VARCHAR";
+  switch (type) {
+    case FCT_BOOLEAN: name = "BOOLEAN"; break;
+    case FCT_BIGINT: name = "BIGINT"; break;
+    case FCT_DOUBLE: name = "DOUBLE"; break;
+    case FCT_DATE: name = "DATE"; break;
+    case FCT_DATETIME: name = "DATETIME"; break;
+    default: name = "VARCHAR"; break;
+  }
+  return name;
+}
+
+static int file_case_cmp(const char *lhs, const char *rhs)
+{
+  int result = 0;
+  while (0 == result && ('\0' != *lhs || '\0' != *rhs)) {
+    result = tolower(static_cast<unsigned char>(*lhs)) - tolower(static_cast<unsigned char>(*rhs));
+    if ('\0' != *lhs) { ++lhs; }
+    if ('\0' != *rhs) { ++rhs; }
+  }
+  return result;
+}
+
+static bool file_is_digit(const char c) { return c >= '0' && c <= '9'; }
+
+static bool file_str_is_int(const std::string &value, int64_t &result)
+{
+  bool is_int = !value.empty() && value.size() <= 20;
+  int64_t number = 0;
+  size_t i = 0;
+  if (is_int && ('-' == value[0] || '+' == value[0])) {
+    i = 1;
+    is_int = value.size() > 1;
+  }
+  for (; is_int && i < value.size(); ++i) {
+    if (!file_is_digit(value[i])) {
+      is_int = false;
+    } else {
+      number = number * 10 + (value[i] - '0');
+      if (number < 0) {
+        is_int = false;
+      }
+    }
+  }
+  if (is_int) {
+    result = ('-' == value[0]) ? -number : number;
+  }
+  return is_int;
+}
+
+static bool file_str_is_double(const std::string &value)
+{
+  bool is_double = !value.empty();
+  char *end = NULL;
+  errno = 0;
+  const double parsed = strtod(value.c_str(), &end);
+  UNUSED(parsed);
+  if (0 != errno || NULL == end || end != value.c_str() + value.size()) {
+    is_double = false;
+  }
+  return is_double;
+}
+
+static bool file_str_is_bool(const std::string &value, bool &is_true)
+{
+  bool is_bool = true;
+  if (0 == file_case_cmp(value.c_str(), "true")) {
+    is_true = true;
+  } else if (0 == file_case_cmp(value.c_str(), "false")) {
+    is_true = false;
+  } else {
+    is_bool = false;
+  }
+  return is_bool;
+}
+
+static bool file_str_is_date(const std::string &value)
+{
+  bool is_date = 10 == value.size();
+  for (int64_t i = 0; is_date && i < 10; ++i) {
+    if (4 == i || 7 == i) {
+      is_date = '-' == value[i];
+    } else {
+      is_date = file_is_digit(value[i]);
+    }
+  }
+  if (is_date) {
+    const int month = (value[5] - '0') * 10 + (value[6] - '0');
+    const int day = (value[8] - '0') * 10 + (value[9] - '0');
+    is_date = month >= 1 && month <= 12 && day >= 1 && day <= 31;
+  }
+  return is_date;
+}
+
+static bool file_str_is_datetime(const std::string &value)
+{
+  bool is_datetime = value.size() >= 19;
+  if (is_datetime) {
+    is_datetime = file_str_is_date(value.substr(0, 10))
+                  && (' ' == value[10] || 'T' == value[10])
+                  && ':' == value[13] && ':' == value[16];
+    for (int64_t i = 11; is_datetime && i < 19; ++i) {
+      if (13 == i || 16 == i) {
+        continue;
+      }
+      is_datetime = file_is_digit(value[i]);
+    }
+  }
+  return is_datetime;
+}
+
+// Reduce the observed categories of a column into one DuckDB-like column type.
+// Categories: 1 boolean, 2 integer, 4 double, 8 date, 16 datetime, 32 string.
+static FileColType file_reduce_category(const uint32_t category)
+{
+  FileColType type = FCT_VARCHAR;
+  if (0 == category) {
+    type = FCT_VARCHAR;
+  } else if (1 == category) {
+    type = FCT_BOOLEAN;
+  } else if (2 == category) {
+    type = FCT_BIGINT;
+  } else if (4 == category || 6 == category) {
+    type = FCT_DOUBLE;
+  } else if (8 == category) {
+    type = FCT_DATE;
+  } else if (16 == category || 24 == category) {
+    type = FCT_DATETIME;
+  } else {
+    type = FCT_VARCHAR;
+  }
+  return type;
+}
+
+static uint32_t file_value_category(const std::string &value, std::string &normalized)
+{
+  uint32_t category = 32;
+  int64_t int_value = 0;
+  bool bool_value = false;
+  normalized = value;
+  if (file_str_is_bool(value, bool_value)) {
+    category = 1;
+    normalized = bool_value ? "1" : "0";
+  } else if (file_str_is_int(value, int_value)) {
+    category = 2;
+  } else if (file_str_is_double(value)) {
+    category = 4;
+  } else if (file_str_is_date(value)) {
+    category = 8;
+  } else if (file_str_is_datetime(value)) {
+    category = 16;
+    if ('T' == normalized[10]) {
+      normalized[10] = ' ';
+    }
+  }
+  return category;
+}
+
+static int file_read_all(const std::string &path, std::string &content)
+{
+  int ret = OB_SUCCESS;
+  FILE *file = NULL;
+  if (path.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("empty file path", K(ret));
+  } else if (OB_ISNULL(file = fopen(path.c_str(), "rb"))) {
+    ret = OB_FILE_NOT_EXIST;
+    LOG_WARN("failed to open file table file", K(ret), K(path.c_str()));
+    LOG_USER_ERROR(OB_FILE_NOT_EXIST, path.c_str());
+  } else {
+    char buffer[8192];
+    size_t read_size = 0;
+    while ((read_size = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+      content.append(buffer, read_size);
+    }
+    if (0 != ferror(file)) {
+      ret = OB_IO_ERROR;
+      LOG_WARN("failed to read file table file", K(ret), K(path.c_str()));
+    }
+    fclose(file);
+    file = NULL;
+  }
+  return ret;
+}
+
+static void file_split_csv(const std::string &content,
+                           const char delim,
+                           std::vector<std::vector<std::string>> &records)
+{
+  std::vector<std::string> record;
+  std::string field;
+  bool in_quote = false;
+  bool field_started = false;
+  size_t pos = 0;
+  while (pos < content.size()) {
+    const char c = content[pos];
+    if (in_quote) {
+      if ('"' == c) {
+        if (pos + 1 < content.size() && '"' == content[pos + 1]) {
+          field.push_back('"');
+          pos += 2;
+          continue;
+        }
+        in_quote = false;
+        ++pos;
+        continue;
+      }
+      if ('\r' == c && pos + 1 < content.size() && '\n' == content[pos + 1]) {
+        field.push_back('\n');
+        pos += 2;
+        continue;
+      }
+      field.push_back(c);
+      ++pos;
+      continue;
+    }
+    if ('"' == c && !field_started) {
+      in_quote = true;
+      field_started = true;
+      ++pos;
+      continue;
+    }
+    if (delim == c) {
+      record.push_back(field);
+      field.clear();
+      field_started = false;
+      ++pos;
+      continue;
+    }
+    if ('\r' == c || '\n' == c) {
+      record.push_back(field);
+      field.clear();
+      field_started = false;
+      records.push_back(record);
+      record.clear();
+      if ('\r' == c && pos + 1 < content.size() && '\n' == content[pos + 1]) {
+        pos += 2;
+      } else {
+        ++pos;
+      }
+      continue;
+    }
+    field.push_back(c);
+    field_started = true;
+    ++pos;
+  }
+  if (!field.empty() || field_started || !record.empty()) {
+    record.push_back(field);
+    records.push_back(record);
+  }
+}
+
+static std::string file_make_column_name(const std::string &raw, const int64_t index)
+{
+  std::string name = raw;
+  while (!name.empty() && (' ' == name[0] || '\t' == name[0])) {
+    name.erase(0, 1);
+  }
+  while (!name.empty() && (' ' == name[name.size() - 1] || '\t' == name[name.size() - 1])) {
+    name.erase(name.size() - 1);
+  }
+  if (name.empty()) {
+    name = "column" + std::to_string(index);
+  }
+  return name;
+}
+
+static void file_deduplicate_names(std::vector<std::string> &names)
+{
+  std::vector<int64_t> seen;
+  for (int64_t i = 0; i < static_cast<int64_t>(names.size()); ++i) {
+    std::string name = names[i];
+    int64_t suffix = 2;
+    bool duplicated = true;
+    while (duplicated) {
+      duplicated = false;
+      for (int64_t j = 0; !duplicated && j < i; ++j) {
+        if (0 == file_case_cmp(names[j].c_str(), name.c_str())) {
+          duplicated = true;
+        }
+      }
+      if (duplicated) {
+        name = names[i] + "__" + std::to_string(suffix++);
+      }
+    }
+    names[i] = name;
+  }
+  seen.clear();
+}
+
+static int file_build_csv_table(const std::string &content,
+                                const bool has_header,
+                                FileTableData &data)
+{
+  int ret = OB_SUCCESS;
+  std::vector<std::vector<std::string>> records;
+  file_split_csv(content, ',', records);
+  int64_t row_count = static_cast<int64_t>(records.size());
+  int64_t column_count = 0;
+  int64_t first_data_row = 0;
+  if (has_header && row_count > 0) {
+    column_count = static_cast<int64_t>(records[0].size());
+    first_data_row = 1;
+  } else if (row_count > 0) {
+    column_count = static_cast<int64_t>(records[0].size());
+  }
+  if (column_count <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("empty csv file table", K(ret));
+  } else {
+    data.schema_.names_.resize(column_count);
+    for (int64_t i = 0; i < column_count; ++i) {
+      if (has_header) {
+        data.schema_.names_[i] = file_make_column_name(records[0][i], i + 1);
+      } else {
+        data.schema_.names_[i] = "column" + std::to_string(i + 1);
+      }
+    }
+    file_deduplicate_names(data.schema_.names_);
+    std::vector<uint32_t> categories(column_count, 0);
+    std::vector<bool> nullable(column_count, false);
+    for (int64_t r = first_data_row; r < row_count; ++r) {
+      std::vector<std::string> row(column_count);
+      std::vector<char> nulls(column_count, 0);
+      for (int64_t c = 0; c < column_count; ++c) {
+        const std::string value = c < static_cast<int64_t>(records[r].size()) ? records[r][c] : std::string();
+        if (value.empty()) {
+          nulls[c] = 1;
+          nullable[c] = true;
+        } else {
+          std::string normalized;
+          categories[c] |= file_value_category(value, normalized);
+          row[c] = normalized;
+        }
+      }
+      data.rows_.push_back(row);
+      data.nulls_.push_back(nulls);
+    }
+    data.schema_.types_.resize(column_count);
+    data.schema_.nullable_.resize(column_count);
+    for (int64_t c = 0; c < column_count; ++c) {
+      FileColType type = file_reduce_category(categories[c]);
+      data.schema_.types_[c] = type;
+      data.schema_.nullable_[c] = nullable[c];
+      if (FCT_BOOLEAN == type && 0 == (categories[c] & 1)) {
+        data.schema_.types_[c] = FCT_VARCHAR;
+      }
+    }
+  }
+  return ret;
+}
+
+// Minimal flat JSON object parser: the newline delimited files used by file SQL
+// contain one object per line whose member values are scalars.
+static void file_skip_ws(const std::string &text, size_t &pos)
+{
+  while (pos < text.size() && (' ' == text[pos] || '\t' == text[pos]
+        || '\r' == text[pos] || '\n' == text[pos])) {
+    ++pos;
+  }
+}
+
+static bool file_parse_json_string(const std::string &text, size_t &pos, std::string &out)
+{
+  bool ok = pos < text.size() && '"' == text[pos];
+  if (ok) {
+    ++pos;
+    while (pos < text.size()) {
+      const char c = text[pos];
+      if ('"' == c) {
+        ++pos;
+        return true;
+      } else if ('\\' == c && pos + 1 < text.size()) {
+        const char escaped = text[pos + 1];
+        switch (escaped) {
+          case 'n': out.push_back('\n'); break;
+          case 't': out.push_back('\t'); break;
+          case 'r': out.push_back('\r'); break;
+          case 'b': out.push_back('\b'); break;
+          case 'f': out.push_back('\f'); break;
+          case 'u': {
+            if (pos + 5 < text.size()) {
+              unsigned int code = 0;
+              bool digits = true;
+              for (int i = 0; digits && i < 4; ++i) {
+                const char h = text[pos + 2 + i];
+                code <<= 4;
+                if (h >= '0' && h <= '9') {
+                  code += h - '0';
+                } else if (h >= 'a' && h <= 'f') {
+                  code += h - 'a' + 10;
+                } else if (h >= 'A' && h <= 'F') {
+                  code += h - 'A' + 10;
+                } else {
+                  digits = false;
+                }
+              }
+              if (digits) {
+                // Only handle the BMP subset that fits into a single UTF-8 sequence.
+                if (code < 0x80) {
+                  out.push_back(static_cast<char>(code));
+                } else if (code < 0x800) {
+                  out.push_back(static_cast<char>(0xC0 | (code >> 6)));
+                  out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+                } else {
+                  out.push_back(static_cast<char>(0xE0 | (code >> 12)));
+                  out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+                  out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+                }
+                pos += 6;
+                continue;
+              }
+            }
+            out.push_back(escaped);
+            break;
+          }
+          default: out.push_back(escaped); break;
+        }
+        pos += 2;
+      } else {
+        out.push_back(c);
+        ++pos;
+      }
+    }
+    ok = false;
+  }
+  return ok;
+}
+
+// Returns 1 when the object was parsed, 0 when the value is not an object.
+static bool file_parse_json_object(const std::string &text,
+                                   size_t &pos,
+                                   std::vector<std::string> &keys,
+                                   std::vector<std::string> &values,
+                                   std::vector<char> &is_null)
+{
+  bool ok = pos < text.size() && '{' == text[pos];
+  if (ok) {
+    ++pos;
+    file_skip_ws(text, pos);
+    if (pos < text.size() && '}' == text[pos]) {
+      ++pos;
+    } else {
+      while (ok && pos < text.size()) {
+        std::string key;
+        if (!file_parse_json_string(text, pos, key)) {
+          ok = false;
+          break;
+        }
+        file_skip_ws(text, pos);
+        if (pos >= text.size() || ':' != text[pos]) {
+          ok = false;
+          break;
+        }
+        ++pos;
+        file_skip_ws(text, pos);
+        if (pos >= text.size()) {
+          ok = false;
+          break;
+        }
+        std::string value;
+        char null_flag = 0;
+        const char c = text[pos];
+        if ('"' == c) {
+          if (!file_parse_json_string(text, pos, value)) {
+            ok = false;
+          }
+        } else if ('t' == c && text.compare(pos, 4, "true") == 0) {
+          value = "true";
+          pos += 4;
+        } else if ('f' == c && text.compare(pos, 5, "false") == 0) {
+          value = "false";
+          pos += 5;
+        } else if ('n' == c && text.compare(pos, 4, "null") == 0) {
+          null_flag = 1;
+          pos += 4;
+        } else {
+          const size_t start = pos;
+          while (pos < text.size() && ',' != text[pos] && '}' != text[pos]
+                 && ' ' != text[pos] && '\t' != text[pos]) {
+            ++pos;
+          }
+          value = text.substr(start, pos - start);
+        }
+        if (ok) {
+          keys.push_back(key);
+          values.push_back(value);
+          is_null.push_back(null_flag);
+        }
+        file_skip_ws(text, pos);
+        if (pos < text.size() && ',' == text[pos]) {
+          ++pos;
+          file_skip_ws(text, pos);
+        } else if (pos < text.size() && '}' == text[pos]) {
+          ++pos;
+          ok = true;
+          break;
+        } else {
+          ok = false;
+        }
+      }
+    }
+  }
+  return ok;
+}
+
+static int file_build_jsonl_table(const std::string &content, FileTableData &data)
+{
+  int ret = OB_SUCCESS;
+  size_t pos = 0;
+  std::vector<std::vector<std::string>> rows;
+  std::vector<std::vector<char>> null_rows;
+  std::vector<uint32_t> categories;
+  size_t line_count = 0;
+  while (pos < content.size()) {
+    size_t line_end = content.find('\n', pos);
+    if (std::string::npos == line_end) {
+      line_end = content.size();
+    }
+    std::string line = content.substr(pos, line_end - pos);
+    pos = line_end + 1;
+    size_t cursor = 0;
+    file_skip_ws(line, cursor);
+    if (cursor >= line.size()) {
+      continue;
+    }
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    std::vector<char> is_null;
+    if (!file_parse_json_object(line, cursor, keys, values, is_null)) {
+      ret = OB_INVALID_DATA;
+      LOG_WARN("invalid json line in file table", K(ret), K(line.c_str()));
+      break;
+    }
+    ++line_count;
+    std::vector<std::string> row;
+    std::vector<char> nulls;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      int64_t column = -1;
+      for (size_t j = 0; j < data.schema_.names_.size(); ++j) {
+        if (data.schema_.names_[j] == keys[i]) {
+          column = static_cast<int64_t>(j);
+          break;
+        }
+      }
+      if (column < 0) {
+        data.schema_.names_.push_back(keys[i]);
+        categories.push_back(0);
+        for (size_t r = 0; r < rows.size(); ++r) {
+          rows[r].push_back(std::string());
+          null_rows[r].push_back(1);
+        }
+        column = static_cast<int64_t>(data.schema_.names_.size()) - 1;
+      }
+      while (static_cast<int64_t>(row.size()) < column) {
+        row.push_back(std::string());
+        nulls.push_back(1);
+      }
+      if (is_null[i]) {
+        row.push_back(std::string());
+        nulls.push_back(1);
+      } else {
+        std::string normalized;
+        categories[column] |= file_value_category(values[i], normalized);
+        row.push_back(normalized);
+        nulls.push_back(0);
+      }
+    }
+    while (row.size() < data.schema_.names_.size()) {
+      row.push_back(std::string());
+      nulls.push_back(1);
+    }
+    rows.push_back(row);
+    null_rows.push_back(nulls);
+  }
+  if (OB_SUCC(ret) && line_count > 0) {
+    data.rows_ = rows;
+    data.nulls_ = null_rows;
+    data.schema_.types_.resize(data.schema_.names_.size());
+    data.schema_.nullable_.resize(data.schema_.names_.size());
+    for (size_t c = 0; c < data.schema_.names_.size(); ++c) {
+      bool nullable = false;
+      for (size_t r = 0; r < data.nulls_.size(); ++r) {
+        if (data.nulls_[r][c]) {
+          nullable = true;
+        }
+      }
+      data.schema_.types_[c] = file_reduce_category(categories[c]);
+      data.schema_.nullable_[c] = nullable;
+    }
+  }
+  return ret;
+}
+
+static bool file_match_pattern(const char *pattern, const char *name)
+{
+  bool matched = true;
+  while (matched && '\0' != *pattern) {
+    if ('*' == *pattern) {
+      ++pattern;
+      if ('\0' == *pattern) {
+        return true;
+      }
+      while (matched && '\0' != *name) {
+        if (file_match_pattern(pattern, name)) {
+          matched = true;
+          return matched;
+        }
+        ++name;
+      }
+      matched = file_match_pattern(pattern, name);
+      return matched;
+    } else if ('?' == *pattern) {
+      if ('\0' == *name) {
+        matched = false;
+      } else {
+        ++pattern;
+        ++name;
+      }
+    } else if (*pattern == *name) {
+      ++pattern;
+      ++name;
+    } else {
+      matched = false;
+    }
+  }
+  if (matched) {
+    matched = '\0' == *name;
+  }
+  return matched;
+}
+
+static int file_glob(const std::string &pattern, std::vector<std::string> &files)
+{
+  int ret = OB_SUCCESS;
+  std::string dir;
+  std::string name_pattern;
+  size_t slash = pattern.find_last_of("/\\");
+  if (std::string::npos == slash) {
+    dir = ".";
+    name_pattern = pattern;
+  } else {
+    dir = pattern.substr(0, slash);
+    if (dir.empty()) {
+      dir = "/";
+    }
+    name_pattern = pattern.substr(slash + 1);
+  }
+  if (name_pattern.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid glob pattern", K(ret), K(pattern.c_str()));
+  }
+#ifdef _WIN32
+  if (OB_SUCC(ret)) {
+    std::string search = dir + "\\*";
+    intptr_t handle = 0;
+    struct _finddata_t find_data;
+    if (-1 == (handle = _findfirst(search.c_str(), &find_data))) {
+      ret = OB_FILE_NOT_EXIST;
+      LOG_WARN("failed to list glob directory", K(ret), K(dir.c_str()));
+    } else {
+      do {
+        if (0 == strcmp(find_data.name, ".") || 0 == strcmp(find_data.name, "..")) {
+          continue;
+        }
+        if (file_match_pattern(name_pattern.c_str(), find_data.name)) {
+          std::string full = dir + "/" + find_data.name;
+          files.push_back(full);
+        }
+      } while (0 == _findnext(handle, &find_data));
+      _findclose(handle);
+    }
+  }
+#else
+  if (OB_SUCC(ret)) {
+    DIR *directory = opendir(dir.c_str());
+    if (NULL == directory) {
+      ret = OB_FILE_NOT_EXIST;
+      LOG_WARN("failed to list glob directory", K(ret), K(dir.c_str()));
+    } else {
+      struct dirent *entry = NULL;
+      while (NULL != (entry = readdir(directory))) {
+        if (0 == strcmp(entry->d_name, ".") || 0 == strcmp(entry->d_name, "..")) {
+          continue;
+        }
+        if (file_match_pattern(name_pattern.c_str(), entry->d_name)) {
+          std::string full = dir + "/" + entry->d_name;
+          files.push_back(full);
+        }
+      }
+      closedir(directory);
+    }
+  }
+#endif
+  return ret;
+}
+
+static void file_append_escaped(std::string &out, const std::string &value)
+{
+  out.push_back('\'');
+  for (size_t i = 0; i < value.size(); ++i) {
+    const char c = value[i];
+    switch (c) {
+      case '\'': out.append("\\'"); break;
+      case '\\': out.append("\\\\"); break;
+      case '\n': out.append("\\n"); break;
+      case '\r': out.append("\\r"); break;
+      case '\t': out.append("\\t"); break;
+      case '\0': out.append("\\0"); break;
+      default: out.push_back(c); break;
+    }
+  }
+  out.push_back('\'');
+}
+
+static void file_append_literal(std::string &out,
+                                const FileColType type,
+                                const std::string &value)
+{
+  switch (type) {
+    case FCT_BOOLEAN:
+    case FCT_BIGINT:
+      out.append("CAST(");
+      file_append_escaped(out, value);
+      out.append(" AS SIGNED)");
+      break;
+    case FCT_DOUBLE:
+      out.append("CAST(");
+      file_append_escaped(out, value);
+      out.append(" AS DOUBLE)");
+      break;
+    case FCT_DATE:
+      out.append("CAST(");
+      file_append_escaped(out, value);
+      out.append(" AS DATE)");
+      break;
+    case FCT_DATETIME:
+      out.append("CAST(");
+      file_append_escaped(out, value);
+      out.append(" AS DATETIME)");
+      break;
+    default:
+      file_append_escaped(out, value);
+      break;
+  }
+}
+
+static void file_append_quoted_name(std::string &out, const std::string &name)
+{
+  out.push_back('`');
+  for (size_t i = 0; i < name.size(); ++i) {
+    out.push_back(name[i]);
+    if ('`' == name[i]) {
+      out.push_back('`');
+    }
+  }
+  out.push_back('`');
+}
+
+static void file_build_rows_sql(const FileTableData &data, std::string &sql)
+{
+  const int64_t column_count = static_cast<int64_t>(data.schema_.names_.size());
+  if (data.rows_.empty()) {
+    sql.append("SELECT ");
+    for (int64_t c = 0; c < column_count; ++c) {
+      if (c > 0) {
+        sql.append(", ");
+      }
+      sql.append("NULL AS ");
+      file_append_quoted_name(sql, data.schema_.names_[c]);
+    }
+    sql.append(" FROM DUAL WHERE 1 = 0");
+  } else {
+    for (int64_t r = 0; r < static_cast<int64_t>(data.rows_.size()); ++r) {
+      if (r > 0) {
+        sql.append(" UNION ALL ");
+      }
+      sql.append("SELECT ");
+      for (int64_t c = 0; c < column_count; ++c) {
+        if (c > 0) {
+          sql.append(", ");
+        }
+        if (data.nulls_[r][c]) {
+          sql.append("NULL");
+        } else {
+          file_append_literal(sql, data.schema_.types_[c], data.rows_[r][c]);
+        }
+        sql.append(" AS ");
+        file_append_quoted_name(sql, data.schema_.names_[c]);
+      }
+    }
+  }
+}
+
+static void file_build_describe_rows_sql(const FileTableData &data, std::string &sql)
+{
+  const int64_t column_count = static_cast<int64_t>(data.schema_.names_.size());
+  if (0 == column_count) {
+    sql.append("SELECT 'column_name' AS column_name, 'column_type' AS column_type, "
+               "'null' AS `null`, 'key' AS `key`, 'default' AS `default`, 'extra' AS extra "
+               "FROM DUAL WHERE 1 = 0");
+  }
+  for (int64_t c = 0; c < column_count; ++c) {
+    if (c > 0) {
+      sql.append(" UNION ALL ");
+    }
+    sql.append("SELECT ");
+    file_append_escaped(sql, data.schema_.names_[c]);
+    sql.append(" AS column_name, ");
+    file_append_escaped(sql, std::string(file_col_type_name(data.schema_.types_[c])));
+    sql.append(" AS column_type, ");
+    file_append_escaped(sql, std::string(data.schema_.nullable_[c] ? "YES" : "NO"));
+    sql.append(" AS `null`, NULL AS `key`, NULL AS `default`, NULL AS extra");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Minimal Parquet reader (thrift compact metadata, snappy, PLAIN encoding)
+// ---------------------------------------------------------------------------
+namespace parquet_internal
+{
+
+struct ThriftValue
+{
+  int32_t type_;
+  int64_t int_;
+  double double_;
+  std::string bytes_;
+  std::vector<ThriftValue> list_;
+  std::vector<std::pair<int64_t, ThriftValue>> fields_;
+  ThriftValue() : type_(0), int_(0), double_(0) {}
+};
+
+struct ThriftReader
+{
+  const uint8_t *buf_;
+  size_t len_;
+  size_t pos_;
+  ThriftReader(const uint8_t *buf, const size_t len, const size_t pos)
+    : buf_(buf), len_(len), pos_(pos) {}
+
+  bool read_byte(uint8_t &value)
+  {
+    bool ok = pos_ < len_;
+    if (ok) {
+      value = buf_[pos_++];
+    }
+    return ok;
+  }
+
+  bool read_varint(uint64_t &value)
+  {
+    bool ok = true;
+    value = 0;
+    int shift = 0;
+    while (ok && shift < 64) {
+      uint8_t byte = 0;
+      if (!(ok = read_byte(byte))) {
+        break;
+      }
+      value |= static_cast<uint64_t>(byte & 0x7F) << shift;
+      if (0 == (byte & 0x80)) {
+        break;
+      }
+      shift += 7;
+    }
+    return ok;
+  }
+
+  bool read_zigzag(int64_t &value)
+  {
+    uint64_t raw = 0;
+    bool ok = read_varint(raw);
+    if (ok) {
+      value = static_cast<int64_t>((raw >> 1) ^ static_cast<uint64_t>(-static_cast<int64_t>(raw & 1)));
+    }
+    return ok;
+  }
+
+  bool read_binary(std::string &value)
+  {
+    uint64_t size = 0;
+    bool ok = read_varint(size);
+    if (ok && pos_ + size > len_) {
+      ok = false;
+    }
+    if (ok) {
+      value.assign(reinterpret_cast<const char *>(buf_ + pos_), static_cast<size_t>(size));
+      pos_ += static_cast<size_t>(size);
+    }
+    return ok;
+  }
+
+  bool read_value(const uint8_t type, ThriftValue &value);
+
+  bool skip_value(const uint8_t type)
+  {
+    ThriftValue ignored;
+    return read_value(type, ignored);
+  }
+
+  bool read_struct(ThriftValue &value)
+  {
+    bool ok = true;
+    value.type_ = 12;
+    int64_t last_field = 0;
+    while (ok) {
+      uint8_t header = 0;
+      if (!(ok = read_byte(header)) || 0 == header) {
+        break;
+      }
+      const uint8_t type = header & 0x0F;
+      int64_t field_id = last_field + (header >> 4);
+      if (0 == (header >> 4)) {
+        ok = read_zigzag(field_id);
+      }
+      if (ok) {
+        last_field = field_id;
+        ThriftValue field;
+        if (ok && (ok = read_value(type, field))) {
+          value.fields_.push_back(std::make_pair(field_id, field));
+        }
+      }
+    }
+    return ok;
+  }
+};
+
+bool ThriftReader::read_value(const uint8_t type, ThriftValue &value)
+{
+  bool ok = true;
+  value.type_ = type;
+  switch (type) {
+    case 1:  // boolean true
+      value.int_ = 1;
+      break;
+    case 2:  // boolean false
+      value.int_ = 0;
+      break;
+    case 3: {  // byte
+      uint8_t byte = 0;
+      ok = read_byte(byte);
+      value.int_ = static_cast<int8_t>(byte);
+      break;
+    }
+    case 4:
+    case 5:
+    case 6:  // i16, i32, i64
+      ok = read_zigzag(value.int_);
+      break;
+    case 7: {  // double
+      if (pos_ + 8 > len_) {
+        ok = false;
+      } else {
+        double number = 0;
+        memcpy(&number, buf_ + pos_, 8);
+        pos_ += 8;
+        value.double_ = number;
+      }
+      break;
+    }
+    case 8:  // binary
+      ok = read_binary(value.bytes_);
+      break;
+    case 9:
+    case 10: {  // list, set
+      uint8_t header = 0;
+      if (!(ok = read_byte(header))) {
+        break;
+      }
+      uint64_t size = header >> 4;
+      const uint8_t elem_type = header & 0x0F;
+      if (15 == size) {
+        ok = read_varint(size);
+      }
+      for (uint64_t i = 0; ok && i < size; ++i) {
+        ThriftValue elem;
+        if (!(ok = read_value(elem_type, elem))) {
+          break;
+        }
+        value.list_.push_back(elem);
+      }
+      break;
+    }
+    case 11: {  // map
+      uint64_t size = 0;
+      if (!(ok = read_varint(size)) || 0 == size) {
+        break;
+      }
+      uint8_t header = 0;
+      if (!(ok = read_byte(header))) {
+        break;
+      }
+      for (uint64_t i = 0; ok && i < size; ++i) {
+        ThriftValue key;
+        ThriftValue elem;
+        if (!(ok = read_value(header >> 4, key)) || !(ok = read_value(header & 0x0F, elem))) {
+          break;
+        }
+      }
+      break;
+    }
+    case 12:  // struct
+      ok = read_struct(value);
+      break;
+    default:
+      ok = false;
+      break;
+  }
+  return ok;
+}
+
+static const ThriftValue *file_thrift_find(const ThriftValue &value, const int64_t field_id)
+{
+  const ThriftValue *found = NULL;
+  for (size_t i = 0; NULL == found && i < value.fields_.size(); ++i) {
+    if (value.fields_[i].first == field_id) {
+      found = &value.fields_[i].second;
+    }
+  }
+  return found;
+}
+
+static int64_t file_thrift_int(const ThriftValue &value, const int64_t field_id, const int64_t def)
+{
+  const ThriftValue *field = file_thrift_find(value, field_id);
+  return NULL == field ? def : field->int_;
+}
+
+static bool file_snappy_uncompress(const uint8_t *src, const size_t src_len, std::string &out)
+{
+  bool ok = src_len > 0;
+  size_t pos = 0;
+  uint64_t expected = 0;
+  int shift = 0;
+  while (ok) {
+    if (pos >= src_len || shift > 32) {
+      ok = false;
+      break;
+    }
+    const uint8_t byte = src[pos++];
+    expected |= static_cast<uint64_t>(byte & 0x7F) << shift;
+    if (0 == (byte & 0x80)) {
+      break;
+    }
+    shift += 7;
+  }
+  if (ok) {
+    out.clear();
+    out.reserve(static_cast<size_t>(expected));
+  }
+  while (ok && pos < src_len) {
+    const uint8_t tag = src[pos++];
+    const uint32_t kind = tag & 0x03;
+    if (0 == kind) {  // literal
+      uint32_t length = (tag >> 2) + 1;
+      if (length > 60) {
+        const uint32_t extra = length - 60;
+        if (pos + extra > src_len) {
+          ok = false;
+          break;
+        }
+        length = 0;
+        for (uint32_t i = 0; i < extra; ++i) {
+          length |= static_cast<uint32_t>(src[pos + i]) << (8 * i);
+        }
+        length += 1;
+        pos += extra;
+      }
+      if (!ok || pos + length > src_len) {
+        ok = false;
+        break;
+      }
+      out.append(reinterpret_cast<const char *>(src + pos), length);
+      pos += length;
+    } else {  // copy
+      uint32_t length = 0;
+      uint32_t offset = 0;
+      if (1 == kind) {
+        if (pos + 1 > src_len) {
+          ok = false;
+          break;
+        }
+        length = 4 + ((tag >> 2) & 0x07);
+        offset = (static_cast<uint32_t>(tag >> 5) << 8) | src[pos];
+        pos += 1;
+      } else if (2 == kind) {
+        if (pos + 2 > src_len) {
+          ok = false;
+          break;
+        }
+        length = (tag >> 2) + 1;
+        offset = static_cast<uint32_t>(src[pos]) | (static_cast<uint32_t>(src[pos + 1]) << 8);
+        pos += 2;
+      } else {
+        if (pos + 4 > src_len) {
+          ok = false;
+          break;
+        }
+        length = (tag >> 2) + 1;
+        offset = static_cast<uint32_t>(src[pos]) | (static_cast<uint32_t>(src[pos + 1]) << 8)
+                 | (static_cast<uint32_t>(src[pos + 2]) << 16)
+                 | (static_cast<uint32_t>(src[pos + 3]) << 24);
+        pos += 4;
+      }
+      if (!ok || 0 == offset || offset > out.size()) {
+        ok = false;
+        break;
+      }
+      const size_t start = out.size() - offset;
+      for (uint32_t i = 0; i < length; ++i) {
+        out.push_back(out[start + (i % offset)]);
+      }
+    }
+  }
+  if (ok) {
+    ok = out.size() == static_cast<size_t>(expected);
+  }
+  return ok;
+}
+
+// RLE / bit-packed hybrid decoder used by definition levels and dictionary indexes.
+static bool file_rle_bitpacked_decode(const uint8_t *buf,
+                                      const size_t buf_len,
+                                      const uint32_t bit_width,
+                                      const int64_t value_count,
+                                      std::vector<uint32_t> &values)
+{
+  bool ok = true;
+  size_t pos = 0;
+  values.clear();
+  if (0 == bit_width) {
+    values.assign(static_cast<size_t>(value_count), 0);
+    return true;
+  }
+  const uint32_t byte_width = (bit_width + 7) / 8;
+  while (ok && static_cast<int64_t>(values.size()) < value_count && pos < buf_len) {
+    uint64_t header = 0;
+    int shift = 0;
+    while (ok && pos < buf_len) {
+      const uint8_t byte = buf[pos++];
+      header |= static_cast<uint64_t>(byte & 0x7F) << shift;
+      if (0 == (byte & 0x80)) {
+        break;
+      }
+      shift += 7;
+      if (shift > 32) {
+        ok = false;
+      }
+    }
+    if (!ok) {
+      break;
+    }
+    if (header & 1) {  // bit-packed groups of 8 values
+      const uint64_t groups = header >> 1;
+      const uint64_t bytes = groups * bit_width;
+      if (pos + bytes > buf_len) {
+        ok = false;
+        break;
+      }
+      uint64_t bit_pos = 0;
+      for (uint64_t i = 0; i < groups * 8; ++i) {
+        uint32_t value = 0;
+        for (uint32_t bit = 0; bit < bit_width; ++bit) {
+          const uint64_t absolute = bit_pos + bit;
+          const uint8_t byte = buf[pos + (absolute >> 3)];
+          if (byte & (1 << (absolute & 7))) {
+            value |= 1u << bit;
+          }
+        }
+        bit_pos += bit_width;
+        if (static_cast<int64_t>(values.size()) < value_count) {
+          values.push_back(value);
+        }
+      }
+      pos += bytes;
+    } else {  // RLE run
+      const uint64_t run = header >> 1;
+      if (pos + byte_width > buf_len) {
+        ok = false;
+        break;
+      }
+      uint32_t value = 0;
+      for (uint32_t i = 0; i < byte_width; ++i) {
+        value |= static_cast<uint32_t>(buf[pos + i]) << (8 * i);
+      }
+      pos += byte_width;
+      for (uint64_t i = 0; i < run && static_cast<int64_t>(values.size()) < value_count; ++i) {
+        values.push_back(value);
+      }
+    }
+  }
+  if (ok) {
+    ok = static_cast<int64_t>(values.size()) >= value_count;
+  }
+  return ok;
+}
+
+static void file_parquet_value_to_string(const uint8_t *data,
+                                         const int64_t physical_type,
+                                         const size_t len,
+                                         std::string &value)
+{
+  char buffer[64];
+  switch (physical_type) {
+    case 0: {  // BOOLEAN
+      value = (len > 0 && (data[0] & 1)) ? "true" : "false";
+      break;
+    }
+    case 1: {  // INT32
+      int32_t number = 0;
+      if (len >= 4) {
+        memcpy(&number, data, 4);
+      }
+      snprintf(buffer, sizeof(buffer), "%d", number);
+      value = buffer;
+      break;
+    }
+    case 2: {  // INT64
+      int64_t number = 0;
+      if (len >= 8) {
+        memcpy(&number, data, 8);
+      }
+      snprintf(buffer, sizeof(buffer), "%lld", static_cast<long long>(number));
+      value = buffer;
+      break;
+    }
+    case 4: {  // FLOAT
+      float number = 0;
+      if (len >= 4) {
+        memcpy(&number, data, 4);
+      }
+      snprintf(buffer, sizeof(buffer), "%g", static_cast<double>(number));
+      value = buffer;
+      break;
+    }
+    case 5: {  // DOUBLE
+      double number = 0;
+      if (len >= 8) {
+        memcpy(&number, data, 8);
+      }
+      snprintf(buffer, sizeof(buffer), "%g", number);
+      value = buffer;
+      break;
+    }
+    default:  // BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY
+      value.assign(reinterpret_cast<const char *>(data), len);
+      break;
+  }
+}
+
+static int file_read_parquet(const std::string &path, FileTableData &data)
+{
+  int ret = OB_SUCCESS;
+  std::string content;
+  if (OB_FAIL(file_read_all(path, content))) {
+  } else if (content.size() < 12
+             || 0 != content.compare(0, 4, "PAR1")
+             || 0 != content.compare(content.size() - 4, 4, "PAR1")) {
+    ret = OB_INVALID_DATA;
+    LOG_WARN("invalid parquet file", K(ret), K(path.c_str()));
+  } else {
+    const uint8_t *raw = reinterpret_cast<const uint8_t *>(content.data());
+    const size_t total = content.size();
+    uint32_t footer_size = 0;
+    memcpy(&footer_size, raw + total - 8, 4);
+    if (footer_size + 8 >= total) {
+      ret = OB_INVALID_DATA;
+      LOG_WARN("invalid parquet footer", K(ret), K(footer_size), K(total));
+    } else {
+      ThriftReader reader(raw, total, total - 8 - footer_size);
+      ThriftValue metadata;
+      if (!reader.read_struct(metadata)) {
+        ret = OB_INVALID_DATA;
+        LOG_WARN("failed to parse parquet metadata", K(ret));
+      } else {
+        const ThriftValue *schema = file_thrift_find(metadata, 2);
+        const ThriftValue *row_groups = file_thrift_find(metadata, 4);
+        if (NULL == schema || NULL == row_groups || schema->list_.size() < 2) {
+          ret = OB_INVALID_DATA;
+          LOG_WARN("parquet file has no schema", K(ret));
+        } else {
+          // Schema element 0 describes the root group; the leaves follow in order.
+          for (size_t i = 1; OB_SUCC(ret) && i < schema->list_.size(); ++i) {
+            const ThriftValue &element = schema->list_[i];
+            const ThriftValue *name = file_thrift_find(element, 4);
+            const ThriftValue *num_children = file_thrift_find(element, 5);
+            if (NULL != num_children && num_children->int_ > 0) {
+              continue;  // nested group is not supported
+            }
+            FileColType type = FCT_VARCHAR;
+            const int64_t physical_type = file_thrift_int(element, 1, -1);
+            const int64_t repetition = file_thrift_int(element, 3, 0);
+            if (0 == physical_type || 1 == physical_type || 2 == physical_type) {
+              type = FCT_BIGINT;
+            } else if (4 == physical_type || 5 == physical_type) {
+              type = FCT_DOUBLE;
+            } else {
+              type = FCT_VARCHAR;
+            }
+            data.schema_.names_.push_back(NULL == name ? std::string("column")
+                                                       : name->bytes_);
+            data.schema_.types_.push_back(type);
+            data.schema_.nullable_.push_back(1 == repetition);
+          }
+          if (OB_SUCC(ret) && !row_groups->list_.empty()) {
+            int64_t total_rows = 0;
+            for (size_t g = 0; OB_SUCC(ret) && g < row_groups->list_.size(); ++g) {
+              const ThriftValue &row_group = row_groups->list_[g];
+              const ThriftValue *columns = file_thrift_find(row_group, 1);
+              const int64_t group_rows = file_thrift_int(row_group, 3, 0);
+              if (NULL == columns) {
+                ret = OB_INVALID_DATA;
+                LOG_WARN("parquet row group has no columns", K(ret));
+              } else {
+                std::vector<std::vector<std::string>> group_values(columns->list_.size());
+                std::vector<std::vector<char>> group_nulls(columns->list_.size());
+                for (size_t c = 0; OB_SUCC(ret) && c < columns->list_.size(); ++c) {
+                  const ThriftValue *meta = file_thrift_find(columns->list_[c], 3);
+                  if (NULL == meta) {
+                    ret = OB_INVALID_DATA;
+                    LOG_WARN("parquet column chunk has no metadata", K(ret));
+                  } else {
+                    const int64_t physical_type = file_thrift_int(*meta, 1, -1);
+                    const int64_t codec = file_thrift_int(*meta, 4, 0);
+                    const int64_t num_values = file_thrift_int(*meta, 5, 0);
+                    const int64_t data_offset = file_thrift_int(*meta, 9, 0);
+                    const ThriftValue *dictionary_offset = file_thrift_find(*meta, 11);
+                    size_t page_pos = static_cast<size_t>(
+                        NULL == dictionary_offset ? data_offset : dictionary_offset->int_);
+                    int64_t decoded = 0;
+                    // Dictionary page first, when present.
+                    while (OB_SUCC(ret) && page_pos < total - 8 && decoded < num_values) {
+                      ThriftReader page_reader(raw, total, page_pos);
+                      ThriftValue page;
+                      if (!page_reader.read_struct(page)) {
+                        ret = OB_INVALID_DATA;
+                        LOG_WARN("failed to parse parquet page header", K(ret));
+                      } else {
+                        const int64_t page_type = file_thrift_int(page, 1, -1);
+                        const int64_t uncompressed_size = file_thrift_int(page, 2, 0);
+                        const int64_t compressed_size = file_thrift_int(page, 3, 0);
+                        const uint8_t *page_data = raw + page_reader.pos_;
+                        if (page_reader.pos_ + compressed_size > total) {
+                          ret = OB_INVALID_DATA;
+                          LOG_WARN("parquet page overflows file", K(ret));
+                        } else if (2 == page_type) {
+                          // A dictionary page is irrelevant for PLAIN encoded data pages.
+                          page_pos = page_reader.pos_ + static_cast<size_t>(compressed_size);
+                        } else if (0 == page_type || 3 == page_type) {
+                          const ThriftValue *page_header = file_thrift_find(page, 0 == page_type ? 5 : 8);
+                          int64_t page_values = num_values - decoded;
+                          int64_t encoding = 0;
+                          int64_t definition_length = 0;
+                          int64_t repetition_length = 0;
+                          bool page_compressed = true;
+                          if (NULL != page_header) {
+                            page_values = file_thrift_int(*page_header, 1, page_values);
+                            if (0 == page_type) {
+                              encoding = file_thrift_int(*page_header, 2, 0);
+                              definition_length = file_thrift_int(*page_header, 3, 0);
+                              repetition_length = file_thrift_int(*page_header, 4, 0);
+                            } else {
+                              encoding = file_thrift_int(*page_header, 4, 0);
+                              definition_length = file_thrift_int(*page_header, 5, 0);
+                              repetition_length = file_thrift_int(*page_header, 6, 0);
+                              const ThriftValue *is_compressed = file_thrift_find(*page_header, 7);
+                              page_compressed = NULL == is_compressed || is_compressed->int_ != 0;
+                            }
+                          }
+                          if (2 == encoding || 8 == encoding) {
+                            ret = OB_NOT_SUPPORTED;
+                            LOG_WARN("dictionary encoded parquet pages are not supported", K(ret), K(encoding));
+                          }
+                          std::string decompressed;
+                          const uint8_t *payload = page_data;
+                          size_t payload_len = static_cast<size_t>(compressed_size);
+                          if (3 == page_type) {
+                            // DataPageV2: levels are stored uncompressed in front of the values.
+                            const size_t levels = static_cast<size_t>(definition_length + repetition_length);
+                            if (levels > payload_len) {
+                              ret = OB_INVALID_DATA;
+                              LOG_WARN("parquet page levels overflow", K(ret));
+                            } else if (1 == codec && page_compressed && payload_len > levels) {
+                              if (!file_snappy_uncompress(payload + levels, payload_len - levels, decompressed)) {
+                                ret = OB_INVALID_DATA;
+                                LOG_WARN("failed to uncompress parquet data page", K(ret));
+                              } else {
+                                decompressed.insert(decompressed.begin(), payload, payload + levels);
+                                payload = reinterpret_cast<const uint8_t *>(decompressed.data());
+                                payload_len = decompressed.size();
+                              }
+                            }
+                          } else if (1 == codec) {
+                            if (!file_snappy_uncompress(payload, payload_len, decompressed)) {
+                              ret = OB_INVALID_DATA;
+                              LOG_WARN("failed to uncompress parquet data page", K(ret));
+                            } else {
+                              payload = reinterpret_cast<const uint8_t *>(decompressed.data());
+                              payload_len = decompressed.size();
+                            }
+                          } else if (0 != codec) {
+                            ret = OB_NOT_SUPPORTED;
+                            LOG_WARN("unsupported parquet compression codec", K(ret), K(codec));
+                          }
+                          if (OB_SUCC(ret)) {
+                            size_t value_pos = 0;
+                            std::vector<uint32_t> definitions;
+                            bool has_definitions = false;
+                            if (3 == page_type) {
+                              if (definition_length > 0) {
+                                if (!file_rle_bitpacked_decode(payload, static_cast<size_t>(definition_length),
+                                                               1, page_values, definitions)) {
+                                  ret = OB_INVALID_DATA;
+                                  LOG_WARN("failed to decode parquet definition levels", K(ret));
+                                } else {
+                                  has_definitions = true;
+                                }
+                              }
+                              value_pos = static_cast<size_t>(definition_length + repetition_length);
+                            } else if (0 == page_type && definition_length > 0) {
+                              // DataPageV1 stores a 4 byte length prefix in front of RLE levels.
+                              uint32_t level_bytes = 0;
+                              if (payload_len < 4) {
+                                ret = OB_INVALID_DATA;
+                              } else {
+                                memcpy(&level_bytes, payload, 4);
+                                if (4 + level_bytes > payload_len) {
+                                  ret = OB_INVALID_DATA;
+                                } else if (!file_rle_bitpacked_decode(payload + 4, level_bytes,
+                                                                      1, page_values, definitions)) {
+                                  ret = OB_INVALID_DATA;
+                                  LOG_WARN("failed to decode parquet definition levels", K(ret));
+                                } else {
+                                  has_definitions = true;
+                                  value_pos = 4 + static_cast<size_t>(level_bytes);
+                                }
+                              }
+                              if (OB_SUCC(ret)) {
+                                if (0 != repetition_length) {
+                                  ret = OB_NOT_SUPPORTED;
+                                  LOG_WARN("repeated parquet columns are not supported", K(ret));
+                                } else {
+                                  value_pos = 4 + static_cast<size_t>(level_bytes);
+                                }
+                              }
+                            }
+                            if (OB_SUCC(ret)) {
+                              const int64_t width = (0 == physical_type) ? -1
+                                                    : (1 == physical_type || 4 == physical_type) ? 4
+                                                    : (2 == physical_type || 5 == physical_type) ? 8 : -1;
+                              for (int64_t i = 0; OB_SUCC(ret) && i < page_values; ++i) {
+                                const bool present = !has_definitions || i >= static_cast<int64_t>(definitions.size())
+                                                     || definitions[i] != 0;
+                                if (!present) {
+                                  group_values[c].push_back(std::string());
+                                  group_nulls[c].push_back(1);
+                                } else if (0 == physical_type) {
+                                  if (value_pos >= payload_len) {
+                                    ret = OB_INVALID_DATA;
+                                  } else {
+                                    std::string value;
+                                    file_parquet_value_to_string(payload + value_pos, physical_type, 1, value);
+                                    group_values[c].push_back(value);
+                                    group_nulls[c].push_back(0);
+                                    ++value_pos;
+                                  }
+                                } else if (6 == physical_type || 7 == physical_type) {
+                                  uint32_t len = 0;
+                                  if (7 == physical_type) {
+                                    len = static_cast<uint32_t>(file_thrift_int(*meta, 2, 0));
+                                  } else if (value_pos + 4 <= payload_len) {
+                                    memcpy(&len, payload + value_pos, 4);
+                                    value_pos += 4;
+                                  } else {
+                                    ret = OB_INVALID_DATA;
+                                  }
+                                  if (OB_SUCC(ret)) {
+                                    if (value_pos + len > payload_len) {
+                                      ret = OB_INVALID_DATA;
+                                    } else {
+                                      std::string value;
+                                      file_parquet_value_to_string(payload + value_pos, physical_type, len, value);
+                                      group_values[c].push_back(value);
+                                      group_nulls[c].push_back(0);
+                                      value_pos += len;
+                                    }
+                                  }
+                                } else if (width > 0) {
+                                  if (value_pos + static_cast<size_t>(width) > payload_len) {
+                                    ret = OB_INVALID_DATA;
+                                  } else {
+                                    std::string value;
+                                    file_parquet_value_to_string(payload + value_pos, physical_type,
+                                                                 static_cast<size_t>(width), value);
+                                    group_values[c].push_back(value);
+                                    group_nulls[c].push_back(0);
+                                    value_pos += static_cast<size_t>(width);
+                                  }
+                                } else {
+                                  ret = OB_NOT_SUPPORTED;
+                                  LOG_WARN("unsupported parquet physical type", K(ret), K(physical_type));
+                                }
+                              }
+                              if (OB_SUCC(ret)) {
+                                decoded += page_values;
+                                page_pos = page_reader.pos_ + static_cast<size_t>(compressed_size);
+                              }
+                            }
+                          }
+                        } else {
+                          // Index pages are skipped.
+                          page_pos = page_reader.pos_ + static_cast<size_t>(compressed_size);
+                        }
+                      }
+                    }
+                    if (OB_SUCC(ret) && decoded < num_values) {
+                      ret = OB_INVALID_DATA;
+                      LOG_WARN("parquet column has fewer values than expected", K(ret), K(decoded), K(num_values));
+                    }
+                  }
+                }
+                if (OB_SUCC(ret)) {
+                  for (int64_t r = 0; r < group_rows; ++r) {
+                    std::vector<std::string> row(group_values.size());
+                    std::vector<char> nulls(group_values.size(), 1);
+                    for (size_t c = 0; c < group_values.size(); ++c) {
+                      if (r < static_cast<int64_t>(group_values[c].size())) {
+                        row[c] = group_values[c][r];
+                        nulls[c] = group_nulls[c][r];
+                      }
+                    }
+                    data.rows_.push_back(row);
+                    data.nulls_.push_back(nulls);
+                  }
+                  total_rows += group_rows;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+}  // namespace parquet_internal
+
+struct FileTableOptions
+{
+  bool has_header_;
+  bool format_newline_delimited_;
+  FileTableOptions() : has_header_(true), format_newline_delimited_(true) {}
+};
+
+static int file_table_get_literal(const ParseNode *node, std::string &value, bool &is_string)
+{
+  int ret = OB_SUCCESS;
+  is_string = false;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_PARSER_SYNTAX;
+  } else if (NULL != node->str_value_ && node->str_len_ > 0) {
+    // String literals are turned into parameter markers for plan caching, the
+    // literal text is still available in the parse node.
+    value.assign(node->str_value_, node->str_len_);
+    is_string = true;
+  } else if (T_INT == node->type_) {
+    value = std::to_string(node->value_);
+  } else if (T_BOOL == node->type_) {
+    value = 0 == node->value_ ? "false" : "true";
+    is_string = true;
+  } else if (T_OP_NEG == node->type_ && 1 == node->num_child_
+             && OB_NOT_NULL(node->children_[0])
+             && NULL != node->children_[0]->str_value_) {
+    value = "-";
+    value.append(node->children_[0]->str_value_, node->children_[0]->str_len_);
+  } else if (T_OP_NEG == node->type_ && 1 == node->num_child_
+             && OB_NOT_NULL(node->children_[0]) && T_INT == node->children_[0]->type_) {
+    value = std::to_string(-node->children_[0]->value_);
+  } else if (T_NUMBER == node->type_ && NULL != node->str_value_) {
+    value.assign(node->str_value_, node->str_len_);
+  } else {
+    ret = OB_ERR_PARSE_SQL;
+    LOG_WARN("file table argument must be a literal", K(ret), "node_type", node->type_);
+    LOG_USER_ERROR(OB_ERR_PARSE_SQL, "file table function", 21, "argument must be a literal", 1);
+  }
+  return ret;
+}
+
+static int file_table_read(const ObString &func_name,
+                           const ParseNode &args,
+                           FileTableData &data)
+{
+  int ret = OB_SUCCESS;
+  FileTableOptions options;
+  std::string path;
+  int64_t positional = 0;
+  if (NULL != args.children_ && args.num_child_ > 0) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < args.num_child_; ++i) {
+    const ParseNode *arg = args.children_[i];
+    if (OB_ISNULL(arg)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (T_OP_EQ == arg->type_ && 2 == arg->num_child_ && OB_NOT_NULL(arg->children_[0])
+               && NULL != arg->children_[0]->str_value_) {
+      std::string option_name(arg->children_[0]->str_value_, arg->children_[0]->str_len_);
+      std::string option_value;
+      bool is_string = false;
+      if (OB_FAIL(file_table_get_literal(arg->children_[1], option_value, is_string))) {
+      } else if (0 == file_case_cmp(option_name.c_str(), "header")) {
+        options.has_header_ = 0 == file_case_cmp(option_value.c_str(), "true")
+                              || 0 == file_case_cmp(option_value.c_str(), "on")
+                              || 0 == file_case_cmp(option_value.c_str(), "yes")
+                              || "1" == option_value;
+      } else if (0 == file_case_cmp(option_name.c_str(), "sample_size")) {
+        if ("-1" != option_value) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table sample_size other than -1");
+        }
+      } else if (0 == file_case_cmp(option_name.c_str(), "format")) {
+        if (0 == file_case_cmp(option_value.c_str(), "newline_delimited")
+            || 0 == file_case_cmp(option_value.c_str(), "json")) {
+          options.format_newline_delimited_ = true;
+        } else {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table format");
+        }
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table option");
+      }
+    } else {
+      ++positional;
+      std::string value;
+      bool is_string = false;
+      if (OB_FAIL(file_table_get_literal(arg, value, is_string))) {
+      } else if (!is_string) {
+        ret = OB_ERR_PARSE_SQL;
+        LOG_WARN("file table path must be a string literal", K(ret));
+        LOG_USER_ERROR(OB_ERR_PARSE_SQL, "file table function", 18, "invalid file path", 1);
+      } else if (positional > 1) {
+        ret = OB_ERR_PARSE_SQL;
+        LOG_WARN("too many positional arguments for file table function", K(ret));
+        LOG_USER_ERROR(OB_ERR_PARSE_SQL, "file table function", 22, "unexpected extra argument", 1);
+      } else {
+        path = value;
+      }
+    }
+  }
+  if (OB_SUCC(ret) && path.empty()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("file table function requires a file path", K(ret));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table function without a file path");
+  }
+  if (OB_SUCC(ret)) {
+    if (0 == func_name.case_compare("glob")) {
+      std::vector<std::string> files;
+      if (OB_FAIL(file_glob(path, files))) {
+      } else {
+        data.schema_.names_.push_back("file");
+        data.schema_.types_.push_back(FCT_VARCHAR);
+        data.schema_.nullable_.push_back(false);
+        for (size_t i = 0; i < files.size(); ++i) {
+          std::vector<std::string> row(1);
+          std::vector<char> nulls(1, 0);
+          row[0] = files[i];
+          data.rows_.push_back(row);
+          data.nulls_.push_back(nulls);
+        }
+      }
+    } else {
+      std::string content;
+      if (OB_FAIL(file_read_all(path, content))) {
+      } else if (0 == func_name.case_compare("read_csv")) {
+        ret = file_build_csv_table(content, options.has_header_, data);
+      } else if (0 == func_name.case_compare("read_json")) {
+        ret = file_build_jsonl_table(content, data);
+      } else if (0 == func_name.case_compare("read_parquet")) {
+        ret = parquet_internal::file_read_parquet(path, data);
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("unknown file table function", K(ret), K(func_name));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "unknown file table function");
+      }
+    }
+  }
+  return ret;
+}
+
+}  // namespace file_sql_internal
+
+int ObResolverUtils::is_file_table_function(const ParseNode &node, bool &is_file_table)
+{
+  int ret = OB_SUCCESS;
+  is_file_table = false;
+  if (T_FILE_TABLE_EXPRESSION == node.type_ && node.num_child_ >= 2
+      && OB_NOT_NULL(node.children_[0]) && T_IDENT == node.children_[0]->type_) {
+    const ObString name(node.children_[0]->str_len_, node.children_[0]->str_value_);
+    is_file_table = 0 == name.case_compare("read_csv")
+                    || 0 == name.case_compare("read_json")
+                    || 0 == name.case_compare("read_parquet")
+                    || 0 == name.case_compare("glob");
+  }
+  return ret;
+}
+
+const ParseNode *ObResolverUtils::find_file_table_node(const ParseNode &node)
+{
+  const ParseNode *found = NULL;
+  bool is_file_table = false;
+  if (OB_SUCCESS == is_file_table_function(node, is_file_table) && is_file_table) {
+    found = &node;
+  } else if (NULL != node.children_) {
+    for (int64_t i = 0; NULL == found && i < node.num_child_; ++i) {
+      if (NULL != node.children_[i]) {
+        found = find_file_table_node(*node.children_[i]);
+      }
+    }
+  }
+  return found;
+}
+
+int ObResolverUtils::build_file_table_select_sql(const ParseNode &file_table_node,
+                                                 ObSqlString &sql)
+{
+  int ret = OB_SUCCESS;
+  file_sql_internal::FileTableData data;
+  std::string statement;
+  const ParseNode *name_node = NULL;
+  const ParseNode *args_node = NULL;
+  if (T_FILE_TABLE_EXPRESSION != file_table_node.type_ || file_table_node.num_child_ < 2
+      || OB_ISNULL(name_node = file_table_node.children_[0])
+      || OB_ISNULL(args_node = file_table_node.children_[1])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid file table node", K(ret));
+  } else {
+    const ObString func_name(name_node->str_len_, name_node->str_value_);
+    if (OB_FAIL(file_sql_internal::file_table_read(func_name, *args_node, data))) {
+    } else {
+      file_sql_internal::file_build_rows_sql(data, statement);
+      if (OB_FAIL(sql.assign(statement.c_str(), statement.size()))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObResolverUtils::build_file_describe_sql(const ParseNode &file_table_node,
+                                             ObSqlString &sql)
+{
+  int ret = OB_SUCCESS;
+  file_sql_internal::FileTableData data;
+  std::string statement;
+  const ParseNode *name_node = NULL;
+  const ParseNode *args_node = NULL;
+  if (T_FILE_TABLE_EXPRESSION != file_table_node.type_ || file_table_node.num_child_ < 2
+      || OB_ISNULL(name_node = file_table_node.children_[0])
+      || OB_ISNULL(args_node = file_table_node.children_[1])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid file table node", K(ret));
+  } else {
+    const ObString func_name(name_node->str_len_, name_node->str_value_);
+    if (OB_FAIL(file_sql_internal::file_table_read(func_name, *args_node, data))) {
+    } else {
+      file_sql_internal::file_build_describe_rows_sql(data, statement);
+      if (OB_FAIL(sql.assign(statement.c_str(), statement.size()))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObResolverUtils::check_file_sql_enabled(ObSQLSessionInfo *session_info, bool &enabled)
+{
+  int ret = OB_SUCCESS;
+  enabled = false;
+  bool value = false;
+  if (OB_ISNULL(session_info)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session_info->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, value))) {
+    LOG_WARN("failed to read enable_file_sql", K(ret));
+  } else {
+    enabled = value;
+  }
   return ret;
 }
 

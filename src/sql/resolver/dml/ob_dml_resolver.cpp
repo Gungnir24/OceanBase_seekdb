@@ -2719,6 +2719,13 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
         }
         break;
       }
+      case T_FILE_TABLE_EXPRESSION: {
+        if (OB_ISNULL(session_info_)) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (OB_FAIL(resolve_file_table_item(*table_node, table_item))) {
+        }
+        break;
+      }
       case T_VALUES_TABLE_EXPRESSION: {
         if (OB_FAIL(resolve_values_table_item(*table_node, table_item))) {
         }
@@ -3762,6 +3769,64 @@ int ObDMLResolver::resolve_hybrid_search_item(const ParseNode &parse_tree, Table
 
   if (OB_SUCC(ret) && OB_NOT_NULL(params_.query_ctx_)) {
     params_.query_ctx_->has_hybrid_search_ = true;
+  }
+  return ret;
+}
+
+int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableItem *&table_item)
+{
+  int ret = OB_SUCCESS;
+  bool enabled = false;
+  ObSqlString file_table_sql;
+  ParseResult parse_result;
+  ParseNode *sub_query_wrapper = NULL;
+  ParseNode *alias_node = NULL;
+  ParseNode *select_node = NULL;
+
+  if (T_FILE_TABLE_EXPRESSION != parse_tree.type_ || 3 != parse_tree.num_child_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid file table node", K(ret));
+  } else if (OB_ISNULL(allocator_) || OB_ISNULL(session_info_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("resolver is not inited", K(ret));
+  } else if (OB_FAIL(ObResolverUtils::check_file_sql_enabled(session_info_, enabled))) {
+    LOG_WARN("failed to check enable_file_sql", K(ret));
+  } else if (!enabled) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("file table functions are disabled", K(ret));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table function (set enable_file_sql = ON to enable it)");
+  } else if (OB_FAIL(ObResolverUtils::build_file_table_select_sql(parse_tree, file_table_sql))) {
+    LOG_WARN("failed to build file table sql", K(ret));
+  } else {
+    ObParser parser(*allocator_, session_info_->get_sql_mode(), session_info_->get_charsets4parser());
+    if (OB_FAIL(parser.parse(file_table_sql.string(), parse_result))) {
+      LOG_WARN("failed to parse generated file table sql", K(ret), K(file_table_sql));
+    } else if (OB_ISNULL(parse_result.result_tree_) || parse_result.result_tree_->num_child_ < 1
+               || OB_ISNULL(select_node = parse_result.result_tree_->children_[0])) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("generated file table sql has no select", K(ret));
+    } else if (OB_ISNULL(sub_query_wrapper = new_node(allocator_, T_ALIAS, 2))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate alias node", K(ret));
+    } else {
+      alias_node = parse_tree.children_[2];
+      if (OB_ISNULL(alias_node)) {
+        if (OB_ISNULL(alias_node = new_node(allocator_, T_IDENT, 0))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to allocate file table alias", K(ret));
+        } else {
+          alias_node->str_value_ = const_cast<char *>("__file_table");
+          alias_node->str_len_ = static_cast<int32_t>(strlen("__file_table"));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        sub_query_wrapper->children_[0] = select_node;
+        sub_query_wrapper->children_[1] = alias_node;
+        if (OB_FAIL(ObDMLResolver::resolve_table(*sub_query_wrapper, table_item))) {
+          LOG_WARN("failed to resolve generated file table", K(ret));
+        }
+      }
+    }
   }
   return ret;
 }

@@ -175,7 +175,38 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       sql_ctx->stmt_type_ = ObResolverUtils::get_stmt_type_by_item_type(parse_tree.type_);
     }
 
-    switch (real_parse_tree->type_) {
+    bool file_describe_resolved = false;
+    if (T_EXPLAIN == real_parse_tree->type_ && real_parse_tree->num_child_ >= 5) {
+      const ParseNode *explain_body = real_parse_tree->children_[4];
+      const ParseNode *file_node = NULL;
+      if (OB_NOT_NULL(explain_body)
+          && OB_NOT_NULL(file_node = ObResolverUtils::find_file_table_node(*explain_body))) {
+        bool file_sql_enabled = false;
+        ObSqlString describe_sql;
+        ParseResult describe_result;
+        ParseNode *describe_select = NULL;
+        if (OB_FAIL(ObResolverUtils::check_file_sql_enabled(params_.session_info_, file_sql_enabled))) {
+        } else if (!file_sql_enabled) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "file table function (set enable_file_sql = ON to enable it)");
+        } else if (OB_FAIL(ObResolverUtils::build_file_describe_sql(*file_node, describe_sql))) {
+        } else {
+          ObParser file_parser(*params_.allocator_, params_.session_info_->get_sql_mode(),
+                               params_.session_info_->get_charsets4parser());
+          if (OB_FAIL(file_parser.parse(describe_sql.string(), describe_result))) {
+          } else if (OB_ISNULL(describe_result.result_tree_)
+                     || OB_ISNULL(describe_select = describe_result.result_tree_->children_[0])) {
+            ret = OB_ERR_UNEXPECTED;
+          } else {
+            ret = select_stmt_resolver_func<ObSelectResolver>(params_, *describe_select, stmt);
+            file_describe_resolved = true;
+          }
+        }
+      }
+    }
+    if (file_describe_resolved) {
+      // the statement was resolved as a file table describe select
+    } else switch (real_parse_tree->type_) {
       case T_CREATE_TABLE: {
         REGISTER_STMT_RESOLVER(CreateTable);
         break;
