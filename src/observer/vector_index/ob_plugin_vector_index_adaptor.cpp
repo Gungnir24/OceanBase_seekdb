@@ -1838,7 +1838,26 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
           lib::ObLightBacktraceGuard light_backtrace_guard(false);
           if (!is_sparse_vector_index_type()) {
             ob_mark_cuvs_if_needed(algo_data_, snap_data_->index_);
-            if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, vectors, vids, dim, extra_info_buf, num))) {
+            // Bulk fill: when the snapshot index is still empty and a whole
+            // batch arrives at once, hand it to VSAG's parallel Build() instead
+            // of num single-row inserts. Build() is the multi-threaded graph
+            // construction path (the one the HNSW_SQ flow already uses), so the
+            // serialized index stays a real, complete HNSW graph -- only the
+            // insertion order changes. Any error falls back to add_index().
+            int64_t existing = 0;
+            bool built = false;
+            if (num >= 1024
+                && OB_SUCCESS == obvectorutil::get_index_number(snap_data_->index_, existing)
+                && existing == 0) {
+              if (OB_SUCCESS == obvectorutil::build_index(snap_data_->index_, vectors, vids, dim, num,
+                                                          extra_info_buf)) {
+                built = true;
+              } else {
+                LOG_INFO("[vec index] bulk build unsupported, falling back to add", K(num));
+              }
+            }
+            if (built) {
+            } else if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, vectors, vids, dim, extra_info_buf, num))) {
             }
           } else {
             if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, lens, dims, vals, vids, num, extra_info_buf))) {

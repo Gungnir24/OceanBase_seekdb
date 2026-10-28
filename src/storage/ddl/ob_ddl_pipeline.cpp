@@ -983,21 +983,28 @@ int ObHNSWIndexAppendBufferOperator::append_row_to_batch(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid vector row to batch", K(ret), KP(vector), K(vec_dim_));
   } else {
-    if (OB_ISNULL(batch_vec_buf_) || batch_row_capacity_ < VEC_BATCH_ROW_LIMIT) {
+    // Size the staging buffer so a whole tablet usually lands in one batch: the
+    // first batch of an empty index goes to VSAG's parallel Build(), later ones
+    // fall back to incremental adds. A byte budget caps the footprint so a large
+    // dimension cannot inflate DDL memory.
+    int64_t want_rows = VEC_BATCH_BYTE_BUDGET / (vec_dim_ * static_cast<int64_t>(sizeof(float)));
+    if (want_rows < VEC_BATCH_ROW_LIMIT) { want_rows = VEC_BATCH_ROW_LIMIT; }
+    if (want_rows > VEC_BATCH_MAX_ROWS) { want_rows = VEC_BATCH_MAX_ROWS; }
+    if (OB_ISNULL(batch_vec_buf_) || batch_row_capacity_ < want_rows) {
       batch_allocator_.reuse();
       batch_vec_buf_ = nullptr;
       batch_vid_buf_ = nullptr;
       batch_row_capacity_ = 0;
-      const int64_t bytes = VEC_BATCH_ROW_LIMIT * vec_dim_ * static_cast<int64_t>(sizeof(float));
+      const int64_t bytes = want_rows * vec_dim_ * static_cast<int64_t>(sizeof(float));
       char *vec_buf = static_cast<char *>(batch_allocator_.alloc(bytes));
-      int64_t *vid_buf = static_cast<int64_t *>(batch_allocator_.alloc(VEC_BATCH_ROW_LIMIT * sizeof(int64_t)));
+      int64_t *vid_buf = static_cast<int64_t *>(batch_allocator_.alloc(want_rows * sizeof(int64_t)));
       if (OB_ISNULL(vec_buf) || OB_ISNULL(vid_buf)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_WARN("failed to allocate vector batch buffer", K(ret), K(bytes), K(VEC_BATCH_ROW_LIMIT));
       } else {
         batch_vec_buf_ = vec_buf;
         batch_vid_buf_ = vid_buf;
-        batch_row_capacity_ = VEC_BATCH_ROW_LIMIT;
+        batch_row_capacity_ = want_rows;
         batch_row_count_ = 0;
       }
     }

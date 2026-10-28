@@ -308,6 +308,10 @@ private:
       ObDDLTabletContext *tablet_context);
   int flush_batch(ObDDLTabletContext *tablet_context);
   static constexpr int64_t VEC_BATCH_ROW_LIMIT = 4096;
+  // Upper bound for one staged batch: at most 512 MiB of vectors or 1M rows, so
+  // a whole tablet normally reaches the adaptor as a single bulk build.
+  static constexpr int64_t VEC_BATCH_BYTE_BUDGET = 512LL * 1024 * 1024;
+  static constexpr int64_t VEC_BATCH_MAX_ROWS = 1000000;
 private:
   char *batch_vec_buf_ = nullptr;
   int64_t *batch_vid_buf_ = nullptr;
