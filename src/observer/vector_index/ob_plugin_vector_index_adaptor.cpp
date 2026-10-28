@@ -1027,12 +1027,19 @@ int ObPluginVectorIndexAdaptor::init_hnswsq_mem_data()
   return ret;
 }
 
+// Defined below; declared here because the accessors are the single choke point
+// where a lib=cuvs index opts into the GPU path (the adaptor instance that
+// serves queries is not the one that appended the rows, so marking only on the
+// append path loses the opt-in).
+static inline void ob_mark_cuvs_if_needed(void *algo_data, void *handle);
+
 void *ObPluginVectorIndexAdaptor::get_incr_index()
 {
   void *res = nullptr;
   if (OB_NOT_NULL(incr_data_)) {
     res = incr_data_->index_;
   }
+  ob_mark_cuvs_if_needed(algo_data_, res);
   return res;
 }
 
@@ -1042,6 +1049,7 @@ void *ObPluginVectorIndexAdaptor::get_snap_index()
   if (OB_NOT_NULL(snap_data_)) {
     res = snap_data_->index_;
   }
+  ob_mark_cuvs_if_needed(algo_data_, res);
   return res;
 }
 
@@ -1440,11 +1448,10 @@ static inline void ob_mark_cuvs_if_needed(void *algo_data, void *handle)
       && (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW
           || param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH)) {
     oceanbase::common::obvsag::mark_cuvs_index(handle);
-  } else {
-    LOG_WARN_RET(OB_SUCCESS, "[CUVSPROBE] not marked", KP(handle), KP(param),
-                 "lib", param == nullptr ? -1 : static_cast<int>(param->lib_),
-                 "type", param == nullptr ? -1 : static_cast<int>(param->type_),
-                 "dist", param == nullptr ? -1 : static_cast<int>(param->dist_algorithm_));
+  } else if (param != nullptr && param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS) {
+    LOG_WARN_RET(OB_SUCCESS, "[CUVSPROBE] not marked", KP(handle),
+                 "type", static_cast<int>(param->type_),
+                 "dist", static_cast<int>(param->dist_algorithm_));
   }
 }
 
