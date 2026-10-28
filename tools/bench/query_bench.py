@@ -39,15 +39,22 @@ def main() -> int:
     limit = min(limit, meta["topk"])
 
     proc = subprocess.Popen(
+        # --unbuffered is required: without it the batch client block-buffers its
+        # result rows and the reader below never sees a complete response.
         [args.mysql, "--connect-timeout=5", "--protocol=TCP", "-h127.0.0.1",
-         f"-P{args.port}", "-uroot", "-A", "-N", "-B"],
+         f"-P{args.port}", "-uroot", "-A", "-N", "-B", "--unbuffered"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
     )
 
+    SENTINEL = "__seekdb_done__"
+
     def ask(query, k: int) -> tuple[list[int], float]:
         literal = "[" + ",".join(f"{value:.9g}" for value in query) + "]"
+        # The batch client keeps reading after a statement, so each query is
+        # terminated by a sentinel result set instead of waiting for a blank
+        # line (which batch mode never emits for a piped session).
         sql = (f"use bench; select id from {args.table} order by l2_distance(v, '{literal}') "
-               f"approximate limit {k};\n")
+               f"approximate limit {k}; select '{SENTINEL}';\n")
         started = time.perf_counter()
         proc.stdin.write(sql)
         proc.stdin.flush()
@@ -56,9 +63,9 @@ def main() -> int:
             line = proc.stdout.readline()
             if line == "":
                 raise RuntimeError(proc.stderr.read()[:500])
-            if line.strip() == "":
-                break
             token = line.strip()
+            if token == SENTINEL:
+                break
             if token.isdigit() or (token.startswith("-") and token[1:].isdigit()):
                 ids.append(int(token))
         return ids, time.perf_counter() - started

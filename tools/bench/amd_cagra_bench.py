@@ -42,9 +42,9 @@ OBSERVER_PARAMS = [
     # Mirrors the parameters shipped with the demo image, which are known to
     # bootstrap on the contest container.
     "--parameter", "_memory_budget=16G",
-    "--parameter", "datafile_size=20G",
-    "--parameter", "datafile_maxsize=40G",
-    "--parameter", "log_disk_size=10G",
+    "--parameter", "datafile_size=8G",
+    "--parameter", "datafile_maxsize=16G",
+    "--parameter", "log_disk_size=4G",
     "--log-level", "INFO",
 ]
 
@@ -115,6 +115,9 @@ class Observer:
         if self.args.trace:
             env["OB_VSAG_TRACE"] = "1"
             env["OB_VSAG_TRACE_FILE"] = str(self.trace)
+            # The accelerated bridge reports cuvs_build_us / cuvs_serve markers
+            # only when timing is requested; the shipped one ignores this.
+            env["SEEKDB_CUVS_TIMING"] = "1"
         for item in self.args.set_env:
             name, _, val = item.partition("=")
             env[name] = val
@@ -287,7 +290,12 @@ def run_round(args, dataset: pathlib.Path, template: pathlib.Path, index: int) -
         shutil.rmtree(run_dir)
     log(f"round {index}: copying prepared data directory")
     started = time.time()
-    shutil.copytree(template, run_dir, symlinks=True)
+    shutil.copytree(
+        template, run_dir, symlinks=True,
+        # A stopped observer leaves its unix socket and pid file behind; copying
+        # them across raises ENXIO, they are recreated on start anyway.
+        ignore=shutil.ignore_patterns("*.sock", "*.pid"),
+    )
     copy_seconds = time.time() - started
 
     trace = args.evidence / f"round{index}-trace.log"
@@ -316,7 +324,7 @@ def run_round(args, dataset: pathlib.Path, template: pathlib.Path, index: int) -
         served = False
         first_query_seconds = 0.0
         deadline = time.time() + args.first_query_timeout
-        while time.time() < deadline:
+        while True:
             q0 = time.time()
             out = mysql.run(
                 "use bench; select id from t order by l2_distance(v, '%s') approximate limit %d"
@@ -325,10 +333,17 @@ def run_round(args, dataset: pathlib.Path, template: pathlib.Path, index: int) -
             first_query_seconds = time.time() - q0
             served = any(line.strip() for line in out.stdout.splitlines())
             counts = trace_counts(trace, offset)
-            if args.trace and args.lib == "cuvs" and counts.get("cuvs_serve", 0) == 0:
-                time.sleep(1)
-                continue
-            break
+            # A build is "done" once the query returns rows. When the bridge
+            # reports trace markers we additionally require the CAGRA search to
+            # have served the call, so a silent CPU fallback cannot end the
+            # window early. The shipped baseline bridge emits no markers at all,
+            # so there we simply trust the returned rows.
+            done = served
+            if args.trace and args.lib == "cuvs" and counts:
+                done = served and counts.get("cuvs_serve", 0) > 0
+            if done or time.time() > deadline:
+                break
+            time.sleep(1)
         t2 = time.time()
         result.update({
             "ddl_seconds": round(t1 - t0, 3),
@@ -337,7 +352,8 @@ def run_round(args, dataset: pathlib.Path, template: pathlib.Path, index: int) -
             "first_query_returned": bool(served),
             "trace": trace_counts(trace, offset),
         })
-        if args.lib == "cuvs" and args.trace and result["trace"].get("cuvs_serve", 0) == 0:
+        if (args.lib == "cuvs" and args.trace and result["trace"]
+                and result["trace"].get("cuvs_serve", 0) == 0):
             result["warning"] = "CAGRA search did not serve the first query"
 
         if not args.skip_query_bench:
@@ -391,7 +407,7 @@ def main() -> int:
                         help="NAME=VALUE passed to the observer")
     parser.add_argument("--start-timeout", type=int, default=600)
     parser.add_argument("--build-timeout", type=int, default=86400)
-    parser.add_argument("--first-query-timeout", type=int, default=3600)
+    parser.add_argument("--first-query-timeout", type=int, default=300)
     args = parser.parse_args()
 
     args.base_dir = pathlib.Path(args.base_dir)
