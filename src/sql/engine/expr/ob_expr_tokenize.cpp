@@ -393,17 +393,32 @@ int ObExprTokenize::TokenizeParam::try_load_dictionary_for_ik()
 {
   int ret = OB_SUCCESS;
   bool need_to_load_dic = false;
-  storage::ObDicLoaderHandle dic_loader_handle;
+  // Resolving the loader for a (parser, charset) pair means taking the global
+  // dictionary-loading write lock, which the tokenize expression would otherwise
+  // pay on every single statement even though the loader itself is a singleton
+  // that never changes. Cache the handle per thread: an ObDicLoaderHandle holds
+  // a reference, so the loader cannot go away underneath the cache.
+  static thread_local storage::ObDicLoaderHandle cached_loader;
+  static thread_local ObCharsetType cached_charset = ObCharsetType::CHARSET_INVALID;
   if (OB_FAIL(share::ObFtsIndexBuilderUtil::check_need_to_load_dic(
           parser_name_, need_to_load_dic))) {
   } else if (need_to_load_dic) {
-    if (OB_FAIL(storage::ObGenDicLoader::get_instance().get_dic_loader(
-                    ObString::make_string(storage::ObFTSLiteral::PARSER_NAME_IK), // currently only ik, use parser_name_ without version suffix
-                    ObCharset::charset_type_by_coll(meta_.get_collation_type()),
-                    dic_loader_handle))) {
-    } else if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
-      ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(dic_loader_handle.get_loader()->try_load_dictionary_in_trans())) {
+    const ObCharsetType charset_type =
+        ObCharset::charset_type_by_coll(meta_.get_collation_type());
+    if (!cached_loader.is_valid() || cached_charset != charset_type) {
+      cached_loader.reset();
+      cached_charset = ObCharsetType::CHARSET_INVALID;
+      if (OB_FAIL(storage::ObGenDicLoader::get_instance().get_dic_loader(
+                      ObString::make_string(storage::ObFTSLiteral::PARSER_NAME_IK), // currently only ik, use parser_name_ without version suffix
+                      charset_type,
+                      cached_loader))) {
+      } else if (OB_UNLIKELY(!cached_loader.is_valid())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        cached_charset = charset_type;
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(cached_loader.get_loader()->try_load_dictionary_in_trans())) {
     }
   }
   return ret;
