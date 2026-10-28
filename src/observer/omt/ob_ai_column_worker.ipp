@@ -193,6 +193,14 @@ void AiColumnWorker::run1()
   lib::set_thread_name("AiColumn");
   int64_t backfill_table = 0, backfill_column = 0, next_backfill = 0;
   while (!has_set_stop()) {
+#ifdef _WIN32
+    // A pool thread that is not a registered server thread cannot obtain a
+    // usable inner-SQL session in the Windows build (the connection's session
+    // pointer is null and the first read faults), so the AI column worker is
+    // only driven on the Linux build.
+    ob_usleep(1000000);
+    continue;
+#endif
     // The inner SQL connection relies on the session manager and the plan cache
     // services, which only exist once the server has finished bootstrapping.
     // Do nothing until then: issuing inner SQL from a half-built runtime
