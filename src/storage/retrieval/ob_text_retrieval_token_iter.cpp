@@ -506,10 +506,15 @@ int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
     cur_idx_ = 0;
     const ObDatumVector &relevance_datum = relevance_expr_->locate_expr_datumvector(*eval_ctx_);
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
+    // Doc ids and relevances live in contiguous ObFixedArray instances: take the
+    // raw arrays once per batch instead of going through the polymorphic
+    // ObIArray::at() for every element (this loop runs for every matched doc).
+    double *relevance_arr = count_ > 0 ? &relevance_.at(0) : nullptr;
+    ObDocIdExt *doc_id_arr = count_ > 0 ? &doc_id_.at(0) : nullptr;
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
       if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
-        relevance_[i] = relevance_datum.at(i)->get_double();
-        if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
+        relevance_arr[i] = relevance_datum.at(i)->get_double();
+        if (OB_FAIL(doc_id_arr[i].from_datum(*doc_id_datum.at(i)))) {
         }
       }
     }
@@ -525,9 +530,10 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
   } else {
     cur_idx_ = 0;
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
+    ObDocIdExt *doc_id_arr = count_ > 0 ? &doc_id_.at(0) : nullptr;
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
       if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
-        if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
+        if (OB_FAIL(doc_id_arr[i].from_datum(*doc_id_datum.at(i)))) {
         };
       }
     }
