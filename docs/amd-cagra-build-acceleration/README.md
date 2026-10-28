@@ -52,6 +52,27 @@ cuvs markers (cuvs_build/cuvs_serve): (none)
 （`de17949d57b9`，日志里可见），它的 `add_dense` 是自带的 trace，而我们在冻结
 提交上重建的二进制没有这些标记。
 
+### 2.1 继续定位（已修好前两步）
+
+在 `set_param` / `mark_cuvs_index` / `ob_cuvs_add` / `ob_cuvs_try_search` 里加
+stderr 埋点后测得：
+
+1. `lib=cuvs` **确实被解析**：`init_str=DISTANCE=L2, TYPE=HNSW, LIB=CUVS`，
+   `lib=2`（VIAL_CUVS）；顺手用 `lib=bogus` 验证，SQL 层会直接报
+   “this type of vector index lib is not supported”。
+2. 参数对，但 **`mark_cuvs_index()` 从没在查询用的句柄上调用过**：DDL 追加行
+   用的是 `snap_data_->index_`，而真正服务查询的是另一个 adaptor 实例。
+   已修：把标记下沉到 `get_snap_index()` / `get_incr_index()` 这两个取句柄的
+   唯一入口（幂等，非 cuvs 索引只是几次整型比较）。修复后实测
+   `[CUVMARK] 501 次 / [CUVADD] 500 次`，GPU 缓冲第一次被真正填上。
+3. **仍然差最后一步**：DDL 结束时会 `delete_index` 这个临时句柄，
+   `ob_cuvs_erase()` 把 GPU 缓冲一起删掉；随后查询从序列化数据
+   `fdeserialize` 出一个新索引对象（复用了同一地址），于是
+   `[CUVTRY] miss` → 回退 CPU。实测 100k 构建里仍是 100 000 次
+   `add_dense size=1`（DDL 逐行追加，批量路径没有触发），耗时 49.5 s，
+   与基线持平。
+
+
 ## 3. 基线链路与瓶颈
 
 冻结基线的设计是"CPU 影子索引 + GPU 旁挂"：`lib=cuvs` 只是给普通 HNSW 索引
