@@ -256,3 +256,28 @@ vid ↔ 主键 的映射**（这正是 DDL 每行都带的那个 extra-info 列�
 要进一步追平需要固定内存（pinned buffer）和批量查询路径。
 
 正因为有这个短板，两个开关默认仍然关闭，默认路径保持"CPU 建索引、结果正确"。
+最后一轮把搜索参数收到 itopk=topk+1、search_width=32，并用固定内存（pinned）做
+H2D/D2H 拷贝。100k 复测：
+
+| 配置 | 构建 | 召回@10 | 召回@100 | QPS |
+|---|---|---|---|---|
+| itopk=topk+32, MULTI_KERNEL | 9.95 s | 0.801 | 0.759 | 646 |
+| itopk=topk+8, MULTI_CTA, width=itopk | 8.88 s | 1.000 | 0.9995 | 734 |
+| itopk=topk+8, width=48 | 7.43 s | 0.999 | 0.992 | 775 |
+| itopk=topk+8, width=48 + pinned | 9.29 s | 0.999 | 0.992 | 832 |
+| itopk=topk+1, width=32 + pinned | **7.03 s** | 0.992 | 0.973 | 785 |
+
+QPS 在 646→850 之间跳动，同一配置重测能差 10% 以上，仍然是宿主负载噪声；
+它稳定地落在基线的 77%–84%，**没能达到 90% 的门槛**。瓶颈不在搜索核
+（收窄宽度几乎没换来吞吐），而在每次查询的固定开销：线程交接 + 同步拷贝，
+以及单 worker 串行化（并发场景下会被放大）。
+
+## 3. 最终开关一览（默认值即提交状态）
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| 批量追加（含 extra-info 暂存） | 开 | 20 000 次单行调用压成 5 次 |
+| `SEEKDB_CUVS_GPU_ONLY=1` | 关 | GPU 独占：CPU 只建最小记账图，图交给 CAGRA |
+| `SEEKDB_CUVS_ADOPT=1` | 关 | 索引重载后认领构建期留下的 GPU 缓冲 |
+| `SEEKDB_BULK_BUILD=1` | 关 | 整表交给 VSAG 的 Build() 一次建图 |
+| `SEEKDB_BUILD_THREADS=N` | 不传 | 给 HNSW 传 build_thread_count |
