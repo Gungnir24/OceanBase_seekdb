@@ -1067,6 +1067,9 @@ int ObHNSWIndexAppendBufferOperator::append_row_file(ObDDLRowFile *row_file, ObD
       }
     }
   }
+  if (OB_SUCC(ret) && OB_FAIL(flush_batch(tablet_context))) {
+    LOG_WARN("failed to flush the last vector batch", K(ret));
+  }
   return ret;
 }
 
