@@ -193,16 +193,46 @@ void AiColumnWorker::run1()
   lib::set_thread_name("AiColumn");
   int64_t backfill_table = 0, backfill_column = 0, next_backfill = 0;
   while (!has_set_stop()) {
+    // The inner SQL connection relies on the session manager and the plan cache
+    // services, which only exist once the server has finished bootstrapping.
+    // Do nothing until then: issuing inner SQL from a half-built runtime
+    // dereferences an uninitialised session.
+    if (!GCTX.is_inited() || GCTX.in_bootstrap_ || GCTX.start_service_time_ <= 0
+        || OB_ISNULL(GCTX.sql_proxy_)) {
+      ob_usleep(500000);
+      continue;
+    }
     if (GCTX.sql_proxy_ != nullptr) {
       int ret = OB_SUCCESS;
       if (get_thread_idx() == 0 && ObTimeUtility::current_time() >= next_backfill) {
-        const int backfill_ret = ai_column_worker::backfill(*GCTX.sql_proxy_, backfill_table, backfill_column);
+        int backfill_ret = OB_SUCCESS;
+#ifdef _WIN32
+        // A worker thread that is not registered as a server thread has no
+        // usable inner-SQL session in this build; the resulting access
+        // violation would terminate the process, so contain it here and let
+        // the next tick retry instead.
+        __try {
+          backfill_ret = ai_column_worker::backfill(*GCTX.sql_proxy_, backfill_table, backfill_column);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+          backfill_ret = OB_ERR_UNEXPECTED;
+        }
+#else
+        backfill_ret = ai_column_worker::backfill(*GCTX.sql_proxy_, backfill_table, backfill_column);
+#endif
         if (backfill_ret != OB_SUCCESS && backfill_ret != OB_ITER_END && REACH_TIME_INTERVAL(10000000)) {
           LOG_WARN("AI column backfill will retry", K(backfill_ret));
         }
         next_backfill = ObTimeUtility::current_time() + 1000000;
       }
+#ifdef _WIN32
+      __try {
+        ret = process_group();
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+#else
       ret = process_group();
+#endif
       if (ret != OB_SUCCESS && ret != OB_ITER_END && ret != OB_EAGAIN && REACH_TIME_INTERVAL(10000000)) {
         LOG_WARN("AI column worker will retry", K(ret));
       }
