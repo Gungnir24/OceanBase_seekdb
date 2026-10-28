@@ -18,6 +18,7 @@
 #ifndef OCEANBASE_QUERY_VECTOR_INDEX_ADAPTOR_H_
 #define OCEANBASE_QUERY_VECTOR_INDEX_ADAPTOR_H_
 
+#include <vector>
 #include "share/scn.h"
 #include "common/datum/ob_datum.h"
 #include "roaring/roaring64.h"
@@ -907,6 +908,17 @@ private:
   void *algo_data_;
   ObVectorIndexMemData *incr_data_;
   ObVectorIndexMemData *snap_data_;
+  // [hipVS/cuVS] DDL bulk staging. The offline build feeds rows one at a time,
+  // which turns a 100k-row index into 100k single-row VSAG inserts. Dense rows
+  // without extra-info columns are accumulated here and handed to VSAG in one
+  // build when the snapshot is serialized (or first read), which is the
+  // multi-threaded graph construction path. Staging only starts while the index
+  // is still empty.
+  std::vector<float> ddl_stage_vecs_;
+  std::vector<int64_t> ddl_stage_vids_;
+  int64_t ddl_stage_dim_ = 0;
+  bool ddl_stage_active_ = false;
+  int flush_ddl_stage();
   ObVectorIndexMemData *vbitmap_data_;
 
 

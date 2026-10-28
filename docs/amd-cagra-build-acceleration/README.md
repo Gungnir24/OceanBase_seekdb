@@ -143,3 +143,21 @@ tools/bench/run_all.sh \
   `intermediate_graph_degree=128`、`build_algo=AUTO`），降低图度数会影响
   Recall 门槛；
 - 逐行 `add_snap_index` 的批量化只在"稠密 FP32 且无 extra-info 列"时生效。
+### 2.2 A 阶段的实现与实测（批量追加）
+
+在 adaptor 层和 DDL 层各做了一版批量：
+
+| 改动 | 20k 构建 | 说明 |
+|---|---|---|
+| 基线（冻结提交） | 8.633 s | 20 000 次单行 `add_index` |
+| DDL 层批量（4096/50 万行一档） | — | 被 `extra_column_count=1` 挡住，未生效 |
+| DDL 层批量 + extra-info 一起暂存 | 9.727 s | 生效：`add_snap_index` 只被调用 5 次，每次 4352 行 |
+
+结论很明确：**调用次数不是瓶颈**。把 20 000 次 `add_index` 压成 5 次之后，
+构建时间没有下降（差异在共享机器的噪声范围内），因为耗时集中在 VSAG 的
+逐行 HNSW 图插入（约 0.45 ms/行）本身，而不在调用开销。
+`build_dense`（VSAG 并行 Build）确实被触发过，但带 extra-info 时会让服务端崩溃，
+因此已用 `SEEKDB_BULK_BUILD` 环境变量门控、默认关闭。
+
+也就是说：**只看 CPU 路径，这份基线没有多少可挤的水分**；14 分的构建加速
+必须走 GPU，而 GPU 路径现在卡在 2.1 的第 3 步（缓冲被 DDL 的 delete_index 清掉）。

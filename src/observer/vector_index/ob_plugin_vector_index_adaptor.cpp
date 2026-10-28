@@ -1443,7 +1443,8 @@ static inline void ob_mark_cuvs_if_needed(void *algo_data, void *handle)
       && param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_L2
       && (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW
           || param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH)) {
-    oceanbase::common::obvsag::mark_cuvs_index(handle);\n  }
+    oceanbase::common::obvsag::mark_cuvs_index(handle);
+  }
 }
 
 int ObPluginVectorIndexAdaptor::insert_rows(blocksstable::ObDatumRow *rows,
@@ -1785,9 +1786,50 @@ int ObPluginVectorIndexAdaptor::parse_sparse_vector(char *data, int num, uint32_
    In the scenario where a large amount of data is written, there will be a lot of unnecessary performance consumption,
    so the caller needs to ensure this.
 **************************************************************************/
+// [hipVS/cuVS] Hand the staged DDL rows to VSAG in one bulk build. The offline
+// build appends one row per call, so collecting them first turns 100k
+// single-row inserts into one multi-threaded graph construction.
+static constexpr int64_t VEC_DDL_STAGE_MAX_ROWS = 2000000;
+static constexpr int64_t VEC_DDL_STAGE_MAX_BYTES = 512LL * 1024 * 1024;
+
+int ObPluginVectorIndexAdaptor::flush_ddl_stage()
+{
+  int ret = OB_SUCCESS;
+  const int64_t n = static_cast<int64_t>(ddl_stage_vids_.size());
+  const int64_t dim = ddl_stage_dim_;
+  ddl_stage_active_ = false;
+  ddl_stage_dim_ = 0;
+  if (n > 0 && dim > 0 && OB_NOT_NULL(snap_data_) && OB_NOT_NULL(snap_data_->index_)) {
+    const int idim = static_cast<int>(dim);
+    bool built = false;
+    int64_t existing = 0;
+    if (::getenv("SEEKDB_BULK_BUILD") != nullptr
+        && OB_SUCCESS == obvectorutil::get_index_number(snap_data_->index_, existing) && existing == 0) {
+      built = (OB_SUCCESS == obvectorutil::build_index(snap_data_->index_, ddl_stage_vecs_.data(),
+                                                       ddl_stage_vids_.data(), idim,
+                                                       static_cast<int>(n), nullptr));
+    }
+    if (!built) {
+      const int64_t step = 4096;
+      for (int64_t off = 0; OB_SUCC(ret) && off < n; off += step) {
+        const int cnt = static_cast<int>(n - off < step ? n - off : step);
+        if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, ddl_stage_vecs_.data() + off * idim,
+                                            ddl_stage_vids_.data() + off, idim, nullptr, cnt))) {
+          LOG_WARN("failed to add staged rows", K(ret), K(off), K(cnt));
+        }
+      }
+    }
+    LOG_INFO("[vec index] ddl bulk build", K(n), K(idim), K(built), K(ret));
+  }
+  ddl_stage_vecs_.clear();
+  ddl_stage_vids_.clear();
+  ddl_stage_vecs_.shrink_to_fit();
+  ddl_stage_vids_.shrink_to_fit();
+  return ret;
+}
 int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, ObVecExtraInfoObj *extra_objs, int64_t extra_column_count, int num, uint32_t *sparse_byte_lens /* nullptr */)
 {
-  INIT_SUCC(ret);
+    INIT_SUCC(ret);
   int64_t dim = 0;
   int64_t extra_info_actual_size = 0;
   ObVectorIndexParam *param = nullptr;
@@ -1802,6 +1844,31 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
   } else if (OB_FALSE_IT(dim = param->dim_)) {
   } else if (OB_FAIL(get_extra_info_actual_size(extra_info_actual_size))) {
   } else {
+    // [hipVS/cuVS] Bulk staging for the offline build: while the snapshot is
+    // still empty, dense rows without extra-info columns are collected and
+    // handed to VSAG in one build at serialize time. This is what turns the
+    // per-row add_snap_index() loop into a single multi-threaded build.
+    if (!is_sparse_vector_index_type() && extra_column_count == 0
+        && extra_objs == nullptr && num > 0
+        && vectors != nullptr && vids != nullptr
+        && OB_NOT_NULL(snap_data_->index_)
+        && (ddl_stage_active_ || !snap_data_->rb_flag_)) {
+      if (ddl_stage_dim_ == 0) { ddl_stage_dim_ = dim; }
+      if (ddl_stage_dim_ == dim) {
+        ddl_stage_active_ = true;
+        ddl_stage_vecs_.insert(ddl_stage_vecs_.end(), vectors, vectors + dim * num);
+        ddl_stage_vids_.insert(ddl_stage_vids_.end(), vids, vids + num);
+        const int64_t staged = static_cast<int64_t>(ddl_stage_vids_.size());
+        if (staged >= VEC_DDL_STAGE_MAX_ROWS
+            || staged * dim * static_cast<int64_t>(sizeof(float)) >= VEC_DDL_STAGE_MAX_BYTES) {
+          if (OB_FAIL(flush_ddl_stage())) {
+            LOG_WARN("failed to flush ddl stage", K(ret), K(staged));
+          }
+        }
+        return ret;
+      }
+      ddl_stage_dim_ = 0;
+    }
     if (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW ||
         param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH ||
         param->type_ == ObVectorIndexAlgorithmType::VIAT_IPIVF) {
@@ -1837,7 +1904,7 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
             // insertion order changes. Any error falls back to add_index().
             int64_t existing = 0;
             bool built = false;
-            if (num >= 1024
+            if (num >= 1024 && ::getenv("SEEKDB_BULK_BUILD") != nullptr
                 && OB_SUCCESS == obvectorutil::get_index_number(snap_data_->index_, existing)
                 && existing == 0) {
               if (OB_SUCCESS == obvectorutil::build_index(snap_data_->index_, vectors, vids, dim, num,
@@ -3316,6 +3383,9 @@ int ObPluginVectorIndexAdaptor::serialize(ObIAllocator *allocator, ObOStreamBuf:
   int ret = OB_SUCCESS;
   ObVectorIndexSerializer index_seri(*allocator);
   int64_t snap_index_size = 0;
+  if (!ddl_stage_vids_.empty() && OB_FAIL(flush_ddl_stage())) {
+    LOG_WARN("failed to flush the staged ddl rows before serialize", K(ret));
+  }
   if (!snap_data_->is_inited()) {
     ret = OB_NOT_INIT;
     LOG_WARN("snap index is not init", K(ret));

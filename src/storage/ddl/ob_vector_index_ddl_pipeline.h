@@ -305,6 +305,8 @@ private:
   int append_row_to_batch(
       const int64_t vid,
       const float *vector,
+      const common::ObIArray<common::ObIVector *> &vectors,
+      const int64_t row_pos,
       ObDDLTabletContext *tablet_context);
   int flush_batch(ObDDLTabletContext *tablet_context);
   static constexpr int64_t VEC_BATCH_ROW_LIMIT = 4096;
@@ -315,9 +317,13 @@ private:
 private:
   char *batch_vec_buf_ = nullptr;
   int64_t *batch_vid_buf_ = nullptr;
+  // Extra-info values are staged next to the vectors so a batch still carries
+  // the per-row extra columns; the arena keeps their pointers valid until flush.
+  ObVecExtraInfoObj *batch_extra_buf_ = nullptr;
   int64_t batch_row_count_ = 0;
   int64_t batch_row_capacity_ = 0;
   common::ObArenaAllocator batch_allocator_;
+  common::ObArenaAllocator batch_extra_allocator_;
 private:
   int64_t vec_dim_;
   common::ObString vec_idx_param_;

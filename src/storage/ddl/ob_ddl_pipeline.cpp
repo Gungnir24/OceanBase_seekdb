@@ -918,12 +918,12 @@ int ObHNSWIndexAppendBufferOperator::append_row(
                  row_allocator_, ObLongTextType, CS_TYPE_BINARY, true, vec_str))) {
   } else if (vec_str.length() == 0) {
     // do nothing
-  } else if (extra_column_count == 0 &&
-             vec_str.length() == vec_dim_ * static_cast<int64_t>(sizeof(float))) {
-    // Dense FP32 rows without extra-info columns: stage the row in a packed
-    // buffer so the adapter receives one large add_snap_index() block instead
-    // of one call per row.
-    if (OB_FAIL(append_row_to_batch(vec_vid, reinterpret_cast<const float *>(vec_str.ptr()), tablet_context))) {
+  } else if (vec_str.length() == vec_dim_ * static_cast<int64_t>(sizeof(float))) {
+    // Dense FP32 rows: stage the row in a packed buffer (vectors, vids and the
+    // extra-info values) so the adapter receives one large add_snap_index()
+    // block instead of one call per row.
+    if (OB_FAIL(append_row_to_batch(vec_vid, reinterpret_cast<const float *>(vec_str.ptr()),
+                                    vectors, row_pos, tablet_context))) {
       LOG_WARN("failed to append row to vector batch", K(ret), K(row_pos), K(vec_dim_));
     }
   } else {
@@ -976,9 +976,12 @@ int ObHNSWIndexAppendBufferOperator::append_row(
 int ObHNSWIndexAppendBufferOperator::append_row_to_batch(
     const int64_t vid,
     const float *vector,
+    const common::ObIArray<common::ObIVector *> &vectors,
+    const int64_t row_pos,
     ObDDLTabletContext *tablet_context)
 {
   int ret = OB_SUCCESS;
+  const int64_t extra_count = extra_column_idx_types_.count();
   if (OB_ISNULL(vector) || vec_dim_ <= 0) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid vector row to batch", K(ret), KP(vector), K(vec_dim_));
@@ -998,12 +1001,21 @@ int ObHNSWIndexAppendBufferOperator::append_row_to_batch(
       const int64_t bytes = want_rows * vec_dim_ * static_cast<int64_t>(sizeof(float));
       char *vec_buf = static_cast<char *>(batch_allocator_.alloc(bytes));
       int64_t *vid_buf = static_cast<int64_t *>(batch_allocator_.alloc(want_rows * sizeof(int64_t)));
-      if (OB_ISNULL(vec_buf) || OB_ISNULL(vid_buf)) {
+      ObVecExtraInfoObj *extra_buf = nullptr;
+      if (extra_count > 0) {
+        char *raw = static_cast<char *>(
+            batch_allocator_.alloc(sizeof(ObVecExtraInfoObj) * want_rows * extra_count));
+        if (OB_NOT_NULL(raw)) {
+          extra_buf = new (raw) ObVecExtraInfoObj[want_rows * extra_count];
+        }
+      }
+      if (OB_ISNULL(vec_buf) || OB_ISNULL(vid_buf) || (extra_count > 0 && OB_ISNULL(extra_buf))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("failed to allocate vector batch buffer", K(ret), K(bytes), K(VEC_BATCH_ROW_LIMIT));
+        LOG_WARN("failed to allocate vector batch buffer", K(ret), K(bytes), K(want_rows), K(extra_count));
       } else {
         batch_vec_buf_ = vec_buf;
         batch_vid_buf_ = vid_buf;
+        batch_extra_buf_ = extra_buf;
         batch_row_capacity_ = want_rows;
         batch_row_count_ = 0;
       }
@@ -1015,7 +1027,19 @@ int ObHNSWIndexAppendBufferOperator::append_row_to_batch(
       MEMCPY(batch_vec_buf_ + batch_row_count_ * vec_dim_ * static_cast<int64_t>(sizeof(float)),
              vector, vec_dim_ * static_cast<int64_t>(sizeof(float)));
       batch_vid_buf_[batch_row_count_] = vid;
-      ++batch_row_count_;
+      for (int64_t e = 0; OB_SUCC(ret) && e < extra_count; ++e) {
+        const share::ObExtraInfoIdxType &extra_type = extra_column_idx_types_.at(e);
+        if (vectors.count() <= extra_type.idx_) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("failed to get valid extra_info idx", K(ret), K(extra_type.idx_), K(vectors.count()));
+        } else if (OB_FAIL(batch_extra_buf_[batch_row_count_ * extra_count + e].from_vector(
+                       *vectors.at(extra_type.idx_), row_pos, extra_type.type_, &batch_extra_allocator_))) {
+          LOG_WARN("failed to stage extra info for the vector batch", K(ret), K(e));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ++batch_row_count_;
+      }
     }
   }
   return ret;
@@ -1038,12 +1062,14 @@ int ObHNSWIndexAppendBufferOperator::flush_batch(ObDDLTabletContext *tablet_cont
                    &tablet_context->vector_index_ctx_->vec_idx_param_, tablet_context->vector_index_ctx_->vec_dim_))) {
     } else if (OB_NOT_NULL(adaptor_guard.get_adatper()) &&
                OB_FAIL(adaptor_guard.get_adatper()->add_snap_index(reinterpret_cast<float *>(batch_vec_buf_),
-                                                                   batch_vid_buf_, nullptr, 0,
+                                                                   batch_vid_buf_, batch_extra_buf_,
+                                                                   extra_column_idx_types_.count(),
                                                                    static_cast<int>(batch_row_count_)))) {
       LOG_WARN("failed to add batched rows into vector index", K(ret), K(batch_row_count_));
     }
     if (OB_SUCC(ret)) {
       batch_row_count_ = 0;
+      batch_extra_allocator_.reuse();
     }
   }
   return ret;
