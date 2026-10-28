@@ -612,6 +612,10 @@ int ObPluginVectorIndexAdaptor::set_param(ObString init_str, int64_t dim)
     algo_data_ = hnsw_param;
     hnsw_param->dim_ = dim;
     LOG_INFO("init vector index adapter with param", KPC(hnsw_param)); // change log to debug level later
+    LOG_WARN_RET(OB_SUCCESS, "[CUVSPROBE] set_param", K(init_str),
+                 "lib", static_cast<int>(hnsw_param->lib_),
+                 "type", static_cast<int>(hnsw_param->type_),
+                 "dist", static_cast<int>(hnsw_param->dist_algorithm_));
   }
 
   if (OB_FAIL(ret)) {
@@ -1436,6 +1440,11 @@ static inline void ob_mark_cuvs_if_needed(void *algo_data, void *handle)
       && (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW
           || param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH)) {
     oceanbase::common::obvsag::mark_cuvs_index(handle);
+  } else {
+    LOG_WARN_RET(OB_SUCCESS, "[CUVSPROBE] not marked", KP(handle), KP(param),
+                 "lib", param == nullptr ? -1 : static_cast<int>(param->lib_),
+                 "type", param == nullptr ? -1 : static_cast<int>(param->type_),
+                 "dist", param == nullptr ? -1 : static_cast<int>(param->dist_algorithm_));
   }
 }
 
