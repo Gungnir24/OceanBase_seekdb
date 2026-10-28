@@ -1803,7 +1803,8 @@ int ObPluginVectorIndexAdaptor::flush_ddl_stage()
     const int idim = static_cast<int>(dim);
     bool built = false;
     int64_t existing = 0;
-    if (::getenv("SEEKDB_BULK_BUILD") != nullptr
+    const char *stage_bulk_env = ::getenv("SEEKDB_BULK_BUILD");
+    if (stage_bulk_env != nullptr && stage_bulk_env[0] == '1'
         && OB_SUCCESS == obvectorutil::get_index_number(snap_data_->index_, existing) && existing == 0) {
       built = (OB_SUCCESS == obvectorutil::build_index(snap_data_->index_, ddl_stage_vecs_.data(),
                                                        ddl_stage_vids_.data(), idim,
@@ -1904,7 +1905,13 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
             // insertion order changes. Any error falls back to add_index().
             int64_t existing = 0;
             bool built = false;
-            if (num >= 1024 && ::getenv("SEEKDB_BULK_BUILD") != nullptr
+            // Opt-in (SEEKDB_BULK_BUILD=1): hand the whole block to VSAG's
+            // Build() in one call. It produces an identical index (same recall),
+            // but on the shared test host it measured no faster than the
+            // row-wise path, so it is not enabled by default.
+            const char *bulk_env = ::getenv("SEEKDB_BULK_BUILD");
+            const bool bulk_enabled = (bulk_env != nullptr && bulk_env[0] == '1');
+            if (num >= 1024 && bulk_enabled
                 && OB_SUCCESS == obvectorutil::get_index_number(snap_data_->index_, existing)
                 && existing == 0) {
               if (OB_SUCCESS == obvectorutil::build_index(snap_data_->index_, vectors, vids, dim, num,

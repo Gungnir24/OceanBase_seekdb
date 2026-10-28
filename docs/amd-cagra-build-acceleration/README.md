@@ -194,3 +194,35 @@ vid ↔ 主键 的映射**（这正是 DDL 每行都带的那个 extra-info 列�
 要同时拿到"快 + 对"，只剩一条路：用 VSAG 的批量 Build（并行建图）一次性写入
 图和 extra-info。这条路径已经接好（`SEEKDB_BULK_BUILD=1`），但带 extra-info
 时 VSAG 会段错误，需要单独定位。
+### 2.4 继续优化：并行 Build、线程数、hgraph，以及交替实测
+
+接着把能提分的口子都试了一遍：
+
+1. **Build() 崩溃的真正原因不是 VSAG**，是 uild_index 顺手在 DDL 线程上
+   直接调了 cuVS 建 CAGRA，而那个需要 32MB 栈。改成只缓冲、让惰性 worker 去建
+   之后，Build() 稳定跑通（uild_dense b=100000，一次吃下整表）。
+2. **uild_thread_count 只对 hgraph 输出**，纯 HNSW 根本没传这个参数；
+   补上后发现 VSAG 的 HNSW Build() 并没有因此并行，100k 仍是 51.6 s。
+3. **试 	ype=hgraph**（唯一输出 uild_thread_count 的类型）：SQL 层直接拒绝。
+
+交替实测（同一台机器，base/cand 各一轮交替，20k）：
+
+| 轮次 | 基线 | 候选 | 差异 |
+|---|---|---|---|
+| 1 | 9.856 s | 9.369 s | 候选快 5% |
+| 2 | 9.132 s | 6.221 s | 候选快 32% |
+| 前一组 | 6.445 s | 7.449 s | 候选慢 15% |
+
+同一份配置在这台共享机器上能差出 50%，**单次测量没有意义**；三组配对里两组更快、
+一组更慢，均值约 1.2x，但**这个量级不足以当作稳定的加速结论**。召回在所有配置下
+都完全一致（20k 0.824/0.5916，100k 0.5750/0.3376）。
+
+因此默认行为保持保守：
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| 批量追加（含 extra-info 暂存） | **开** | 20 000 次单行调用压成 5 次 |
+| `SEEKDB_BULK_BUILD=1` | 关 | 整表交给 VSAG 的 Build() 一次建图 |
+| `SEEKDB_CUVS_ADOPT=1` | 关 | 重载后认领构建期 GPU 缓冲 |
+| `SEEKDB_CUVS_GPU_ONLY=1` | 关 | GPU 独占建索引（3.4x，但召回 0）|
+| `SEEKDB_BUILD_THREADS=N` | 不传 | 给 HNSW 传 build_thread_count |

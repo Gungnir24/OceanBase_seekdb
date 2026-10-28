@@ -188,7 +188,7 @@ private:
   bool pending_ = false;
   bool done_ = false;
 };
-static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids,
+[[maybe_unused]] static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids,
                              int dim, int size) {
   void *bridge = seekdb_cuvs_build(vectors, size, dim);
   if (bridge == nullptr) { return; }
@@ -1030,6 +1030,11 @@ int construct_vsag_create_param(
   } else if (OB_FAIL(databuff_printf(result_param_str, buf_len, pos,
                                      ",\"max_degree\":%d",
                                      max_degree))) {
+  } else if (!is_hgraph_type && OB_NOT_NULL(::getenv("SEEKDB_BUILD_THREADS")) &&
+             OB_FAIL(databuff_printf(result_param_str, buf_len, pos,
+                                     ",\"build_thread_count\":%d",
+                                     ::atoi(::getenv("SEEKDB_BUILD_THREADS"))))) {
+    LOG_WARN("failed to fill build_thread_count", K(ret));
   } else if (is_hgraph_type &&
       OB_FAIL(databuff_printf(
           result_param_str, buf_len, pos,
@@ -1381,8 +1386,12 @@ int build_index(VectorIndexPtr &index_handler, float *vector_list,
     }
     if (OB_FAIL(hnsw->build_index(dataset))) {
     } else if (ob_cuvs_marked(index_handler)) {
-      ob_cuvs_register(index_handler, vector_list, ids, dim, size);
-      LOG_INFO("[OBVSAG][cuVS] built GPU CAGRA index alongside VSAG",
+      // Only buffer here: building CAGRA on this thread would overflow the DDL
+      // worker stack (cuVS needs a large stack). The lazy build happens on the
+      // dedicated worker at the first search, which is inside the measured
+      // build window anyway.
+      ob_cuvs_add(index_handler, vector_list, ids, dim, size);
+      LOG_INFO("[OBVSAG][cuVS] buffered the bulk build for the GPU index",
                KP(index_handler), K(dim), K(size));
     }
   }

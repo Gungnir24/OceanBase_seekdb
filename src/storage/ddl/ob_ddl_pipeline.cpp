@@ -1100,9 +1100,6 @@ int ObHNSWIndexAppendBufferOperator::append_row_file(ObDDLRowFile *row_file, ObD
       }
     }
   }
-  if (OB_SUCC(ret) && OB_FAIL(flush_batch(tablet_context))) {
-    LOG_WARN("failed to flush the last vector batch", K(ret));
-  }
   return ret;
 }
 
@@ -1117,7 +1114,17 @@ int ObHNSWIndexAppendBufferOperator::execute(
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
   } else if (input_chunk.is_end_chunk()) {
-    // do nothing
+    // One single flush for the whole build: the staged rows of every row file
+    // stay together, so the index receives the entire tablet as one bulk block
+    // and can build the graph in one parallel pass.
+    ObDDLTabletContext *flush_ctx = nullptr;
+    if (batch_row_count_ > 0) {
+      if (OB_FAIL(get_ddl_tablet_context(flush_ctx))) {
+        LOG_WARN("failed to get the tablet context for the final flush", K(ret));
+      } else if (OB_FAIL(flush_batch(flush_ctx))) {
+        LOG_WARN("failed to flush the staged vector batch", K(ret));
+      }
+    }
   } else {
     ObDDLIndependentDag *dag = nullptr;
     ObDDLTabletContext *tablet_context = nullptr;
