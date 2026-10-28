@@ -474,6 +474,13 @@ public:
     int ret_;
     const ObIArray<ObSortFieldCollation> *sort_collations_;
     const ObIArray<ObSortCmpFunc> *sort_cmp_funs_;
+    // Contiguous views of the two arrays above, cached at init() so that the
+    // comparison hot path does not pay a virtual call to ObIArray::at() for
+    // every sort key of every comparison. All ObIArray implementations used
+    // here (ObSEArray / ObArrayHelper / ObFixedArray) store their elements
+    // contiguously and the arrays are immutable for the lifetime of Compare.
+    const ObSortFieldCollation *sort_collations_arr_;
+    const ObSortCmpFunc *sort_cmp_funs_arr_;
     ObExecContext *exec_ctx_;
     const common::ObDatumAccessContext *access_ctx_;
     bool enable_encode_sortkey_;
