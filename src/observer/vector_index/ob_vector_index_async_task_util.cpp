@@ -1465,9 +1465,9 @@ int ObVecIndexAsyncTask::process_data_for_index(ObPluginVectorIndexAdaptor &adap
                 curr_vector_ptr += vector_str.length();
               }
             } else {
-              for (int j = 0; OB_SUCC(ret) && j < dim; j++) {
-                vectors[current_count * dim + j] = vector_ptr[j];
-              }
+              // Copy the whole vector in one go; the per-float loop below costs
+              // ~dim scalar loads/stores per row and shows up in large builds.
+              MEMCPY(vectors + current_count * dim, vector_ptr, dim * sizeof(float));
             }
             vids[current_count] = vid_datum->storage_datums_[vid_column_pos].get_int();
             vid_bound.set_vid(vid_datum->storage_datums_[vid_column_pos].get_int());

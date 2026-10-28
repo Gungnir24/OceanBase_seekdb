@@ -20,6 +20,8 @@
 #include <map>
 #include <set>
 #include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <vector>
 #include <cstdlib>
 #include <cstdio>
@@ -117,6 +119,69 @@ static inline void ob_vsag_trace(const char *fn, const void *h, long a, long b) 
   (void)fn; (void)h; (void)a; (void)b;
 #endif
 }
+static inline int64_t ob_cuvs_now_us() {
+  return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+// Dedicated 32MB-stack worker for every cuVS call. CAGRA build/search overflow
+// the small OB worker stack, and creating a 32MB pthread per query dominated
+// search latency, so the thread is created once and reused.
+class ObCuvsWorker {
+public:
+  static ObCuvsWorker &instance() {
+    static ObCuvsWorker worker;
+    return worker;
+  }
+  // Runs fn(arg) on the worker thread and waits for completion. Returns false
+  // if the thread could not be started; the caller then keeps its own state.
+  bool run(void *(*fn)(void *), void *arg) {
+    std::unique_lock<std::mutex> lock(mu_);
+    if (!started_) {
+      pthread_attr_t attr;
+      pthread_attr_init(&attr);
+      pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+      started_ = (pthread_create(&tid_, &attr, &ObCuvsWorker::entry, this) == 0);
+      pthread_attr_destroy(&attr);
+    }
+    if (!started_) {
+      return false;
+    }
+    fn_ = fn;
+    arg_ = arg;
+    done_ = false;
+    pending_ = true;
+    cv_.notify_one();
+    cv_done_.wait(lock, [this]() { return done_; });
+    return true;
+  }
+
+private:
+  static void *entry(void *self) {
+    ObCuvsWorker *worker = static_cast<ObCuvsWorker *>(self);
+    std::unique_lock<std::mutex> lock(worker->mu_);
+    while (true) {
+      worker->cv_.wait(lock, [worker]() { return worker->pending_; });
+      worker->pending_ = false;
+      void *(*fn)(void *) = worker->fn_;
+      void *arg = worker->arg_;
+      lock.unlock();
+      fn(arg);
+      lock.lock();
+      worker->done_ = true;
+      worker->cv_done_.notify_one();
+    }
+    return nullptr;
+  }
+  pthread_t tid_{};
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::condition_variable cv_done_;
+  void *(*fn_)(void *) = nullptr;
+  void *arg_ = nullptr;
+  bool started_ = false;
+  bool pending_ = false;
+  bool done_ = false;
+};
 static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids,
                              int dim, int size) {
   void *bridge = seekdb_cuvs_build(vectors, size, dim);
@@ -162,13 +227,16 @@ struct ObCuvsJob {
 static void *ob_cuvs_job(void *arg) {
   ObCuvsJob *j = static_cast<ObCuvsJob *>(arg);
   if (j->need_build) {
+    const int64_t build_start = ob_cuvs_now_us();
     void *nb = seekdb_cuvs_build(j->ent->buf_vecs_.data(), static_cast<long>(j->n),
                                  static_cast<long>(j->dim));
+    const int64_t build_us = ob_cuvs_now_us() - build_start;
     if (nb != nullptr) {
       if (j->ent->bridge_ != nullptr) { seekdb_cuvs_free(j->ent->bridge_); }
       j->ent->bridge_ = nb; j->ent->built_n_ = j->n; j->ent->ids_ = j->ent->buf_ids_;
       j->built_ = true;
     }
+    ob_vsag_trace("cuvs_build_us", j->ent, static_cast<long>(build_us), static_cast<long>(j->n));
   }
   // Freshness/correctness: only serve from the GPU when the cuVS index is
   // up-to-date with the buffer. If rows were added since the last build, the
@@ -244,10 +312,7 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   std::vector<unsigned> off(topk);
   std::vector<float> dst(topk);
   ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  ObCuvsWorker::instance().run(ob_cuvs_job, &job);
   if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
   if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
   // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter

@@ -918,42 +918,125 @@ int ObHNSWIndexAppendBufferOperator::append_row(
                  row_allocator_, ObLongTextType, CS_TYPE_BINARY, true, vec_str))) {
   } else if (vec_str.length() == 0) {
     // do nothing
+  } else if (extra_column_count == 0 &&
+             vec_str.length() == vec_dim_ * static_cast<int64_t>(sizeof(float))) {
+    // Dense FP32 rows without extra-info columns: stage the row in a packed
+    // buffer so the adapter receives one large add_snap_index() block instead
+    // of one call per row.
+    if (OB_FAIL(append_row_to_batch(vec_vid, reinterpret_cast<const float *>(vec_str.ptr()), tablet_context))) {
+      LOG_WARN("failed to append row to vector batch", K(ret), K(row_pos), K(vec_dim_));
+    }
   } else {
+    // Extra-info columns (or an unexpected vector length): keep the original
+    // single-row adaptor call, but drain the packed batch first to preserve the
+    // row order seen by the index.
+    if (OB_FAIL(flush_batch(tablet_context))) {
+      LOG_WARN("failed to flush vector batch", K(ret));
+    } else {
+      ObIVectorIndexRuntime *vec_index_service = ::oceanbase::share::server_service<::oceanbase::storage::ObIVectorIndexRuntime>();
+      ObPluginVectorIndexAdapterGuard adaptor_guard;
+      if (OB_ISNULL(vec_index_service)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("error unexpected, vector index service is nullptr", K(ret));
+      } else if (OB_FAIL(vec_index_service->acquire_adapter_guard(tablet_id_,
+                     ObIndexType::INDEX_TYPE_VEC_INDEX_SNAPSHOT_DATA_LOCAL, adaptor_guard,
+                     &tablet_context->vector_index_ctx_->vec_idx_param_, tablet_context->vector_index_ctx_->vec_dim_))) {
+      } else if (OB_NOT_NULL(adaptor_guard.get_adatper()) &&
+                 OB_FAIL(adaptor_guard.get_adatper()->get_extra_info_actual_size(extra_info_actual_size))) {
+        LOG_WARN("failed to get extra info actual size.", K(ret));
+      } else if (extra_column_count > 0 && extra_info_actual_size > 0) {
+        char *buf = nullptr;
+        if (OB_ISNULL(buf = static_cast<char *>(row_allocator_.alloc(sizeof(ObVecExtraInfoObj) * extra_column_count)))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("allocate memory failed", K(ret), K(extra_column_count));
+        } else if (OB_FALSE_IT(extra_obj = new (buf) ObVecExtraInfoObj[extra_column_count])) {
+        }
+        int64_t datum_row_count = vectors.count();
+        for (int64_t i = 0; OB_SUCC(ret) && i < extra_column_count; ++i) {
+          if (datum_row_count <= extra_column_idx_types_.at(i).idx_) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("failed to get valid extra_info idx", K(ret), K(extra_column_idx_types_.at(i).idx_), K(datum_row_count));
+          } else {
+            const ObIVector &extra_vector = *vectors.at(extra_column_idx_types_.at(i).idx_);
+            if (OB_FAIL(extra_obj[i].from_vector(extra_vector, row_pos, extra_column_idx_types_.at(i).type_, &row_allocator_))) {
+            }
+          }
+        }
+      }
+      uint32_t vec_length = vec_str.length();
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(adaptor_guard.get_adatper()->add_snap_index(reinterpret_cast<float *>(vec_str.ptr()),
+                                                                     &vec_vid, extra_obj, extra_column_count, 1, &vec_length))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObHNSWIndexAppendBufferOperator::append_row_to_batch(
+    const int64_t vid,
+    const float *vector,
+    ObDDLTabletContext *tablet_context)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(vector) || vec_dim_ <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid vector row to batch", K(ret), KP(vector), K(vec_dim_));
+  } else {
+    if (OB_ISNULL(batch_vec_buf_) || batch_row_capacity_ < VEC_BATCH_ROW_LIMIT) {
+      batch_allocator_.reuse();
+      batch_vec_buf_ = nullptr;
+      batch_vid_buf_ = nullptr;
+      batch_row_capacity_ = 0;
+      const int64_t bytes = VEC_BATCH_ROW_LIMIT * vec_dim_ * static_cast<int64_t>(sizeof(float));
+      char *vec_buf = static_cast<char *>(batch_allocator_.alloc(bytes));
+      int64_t *vid_buf = static_cast<int64_t *>(batch_allocator_.alloc(VEC_BATCH_ROW_LIMIT * sizeof(int64_t)));
+      if (OB_ISNULL(vec_buf) || OB_ISNULL(vid_buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate vector batch buffer", K(ret), K(bytes), K(VEC_BATCH_ROW_LIMIT));
+      } else {
+        batch_vec_buf_ = vec_buf;
+        batch_vid_buf_ = vid_buf;
+        batch_row_capacity_ = VEC_BATCH_ROW_LIMIT;
+        batch_row_count_ = 0;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (batch_row_count_ >= batch_row_capacity_ && OB_FAIL(flush_batch(tablet_context))) {
+      LOG_WARN("failed to flush full vector batch", K(ret));
+    } else {
+      MEMCPY(batch_vec_buf_ + batch_row_count_ * vec_dim_ * static_cast<int64_t>(sizeof(float)),
+             vector, vec_dim_ * static_cast<int64_t>(sizeof(float)));
+      batch_vid_buf_[batch_row_count_] = vid;
+      ++batch_row_count_;
+    }
+  }
+  return ret;
+}
+
+int ObHNSWIndexAppendBufferOperator::flush_batch(ObDDLTabletContext *tablet_context)
+{
+  int ret = OB_SUCCESS;
+  if (batch_row_count_ > 0) {
     ObIVectorIndexRuntime *vec_index_service = ::oceanbase::share::server_service<::oceanbase::storage::ObIVectorIndexRuntime>();
     ObPluginVectorIndexAdapterGuard adaptor_guard;
     if (OB_ISNULL(vec_index_service)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("error unexpected, vector index service is nullptr", K(ret));
+    } else if (OB_ISNULL(tablet_context) || OB_ISNULL(tablet_context->vector_index_ctx_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("error unexpected, tablet context is null", K(ret), KP(tablet_context));
     } else if (OB_FAIL(vec_index_service->acquire_adapter_guard(tablet_id_,
                    ObIndexType::INDEX_TYPE_VEC_INDEX_SNAPSHOT_DATA_LOCAL, adaptor_guard,
                    &tablet_context->vector_index_ctx_->vec_idx_param_, tablet_context->vector_index_ctx_->vec_dim_))) {
     } else if (OB_NOT_NULL(adaptor_guard.get_adatper()) &&
-               OB_FAIL(adaptor_guard.get_adatper()->get_extra_info_actual_size(extra_info_actual_size))) {
-      LOG_WARN("failed to get extra info actual size.", K(ret));
-    } else if (extra_column_count > 0 && extra_info_actual_size > 0) {
-      char *buf = nullptr;
-      if (OB_ISNULL(buf = static_cast<char *>(row_allocator_.alloc(sizeof(ObVecExtraInfoObj) * extra_column_count)))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("allocate memory failed", K(ret), K(extra_column_count));
-      } else if (OB_FALSE_IT(extra_obj = new (buf) ObVecExtraInfoObj[extra_column_count])) {
-      }
-      int64_t datum_row_count = vectors.count();
-      for (int64_t i = 0; OB_SUCC(ret) && i < extra_column_count; ++i) {
-        if (datum_row_count <= extra_column_idx_types_.at(i).idx_) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("failed to get valid extra_info idx", K(ret), K(extra_column_idx_types_.at(i).idx_), K(datum_row_count));
-        } else {
-          const ObIVector &extra_vector = *vectors.at(extra_column_idx_types_.at(i).idx_);
-          if (OB_FAIL(extra_obj[i].from_vector(extra_vector, row_pos, extra_column_idx_types_.at(i).type_, &row_allocator_))) {
-          }
-        }
-      }
+               OB_FAIL(adaptor_guard.get_adatper()->add_snap_index(reinterpret_cast<float *>(batch_vec_buf_),
+                                                                   batch_vid_buf_, nullptr, 0,
+                                                                   static_cast<int>(batch_row_count_)))) {
+      LOG_WARN("failed to add batched rows into vector index", K(ret), K(batch_row_count_));
     }
-    uint32_t vec_length = vec_str.length();
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(adaptor_guard.get_adatper()->add_snap_index(reinterpret_cast<float *>(vec_str.ptr()),
-                                                                   &vec_vid, extra_obj, extra_column_count, 1, &vec_length))) {
-    } else {
+    if (OB_SUCC(ret)) {
+      batch_row_count_ = 0;
     }
   }
   return ret;

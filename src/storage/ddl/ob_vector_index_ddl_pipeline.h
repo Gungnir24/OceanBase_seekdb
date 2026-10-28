@@ -299,6 +299,21 @@ private:
       const common::ObIArray<common::ObIVector *> &vectors,
       ObDDLTabletContext *tablet_context);
   int append_row_file(ObDDLRowFile *row_file, ObDDLTabletContext *tablet_context);
+  // Dense FP32 fast path: rows are staged in a contiguous buffer and handed to
+  // the vector adaptor as one block. Without it every row costs one adaptor
+  // lookup plus one single-row VSAG/cuVS add, which dominates DDL build time.
+  int append_row_to_batch(
+      const int64_t vid,
+      const float *vector,
+      ObDDLTabletContext *tablet_context);
+  int flush_batch(ObDDLTabletContext *tablet_context);
+  static constexpr int64_t VEC_BATCH_ROW_LIMIT = 4096;
+private:
+  char *batch_vec_buf_ = nullptr;
+  int64_t *batch_vid_buf_ = nullptr;
+  int64_t batch_row_count_ = 0;
+  int64_t batch_row_capacity_ = 0;
+  common::ObArenaAllocator batch_allocator_;
 private:
   int64_t vec_dim_;
   common::ObString vec_idx_param_;
