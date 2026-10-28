@@ -896,6 +896,8 @@ void set_block_size_limit(uint64_t size)
   vsag::Options::Instance().set_block_size_limit(size);
 }
 
+
+
 bool get_is_hgraph_type(uint8_t create_type)
 {
   bool res = false;
@@ -1011,10 +1013,12 @@ int construct_vsag_create_param(
   int effective_max_degree = max_degree;
   int effective_ef_construction = ef_construction;
   const char *gpu_only_env = ::getenv("SEEKDB_CUVS_GPU_ONLY");
-  if (!is_hgraph_type && gpu_only_env != nullptr && gpu_only_env[0] == '1') {
+  const bool gpu_served = (gpu_only_env != nullptr && gpu_only_env[0] == '1');
+  if (!is_hgraph_type && gpu_served) {
     effective_max_degree = 4;
     effective_ef_construction = 16;
   }
+
   // ObIStreamBuf only supports seeking within the current callback buffer, while
   // VSAG's new format seeks to the footer. Keep the legacy format until global seek is supported.
   int64_t pos = 0;

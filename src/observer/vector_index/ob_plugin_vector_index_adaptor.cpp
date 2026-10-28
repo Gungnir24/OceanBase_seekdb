@@ -793,6 +793,7 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
   const char* const DATATYPE_FLOAT32 = "float32";
   const char* DATATYPE_SPARSE = "sparse";
   if (OB_FAIL(get_hnsw_param(param))) {
+
   } else if (type == VIRT_INC) {
     TCWLockGuard lock_guard(incr_data_->mem_data_rwlock_);
     if (!incr_data_->is_inited()) {
@@ -935,6 +936,7 @@ int ObPluginVectorIndexAdaptor::init_mem_data(ObVectorIndexRecordType type, ObVe
       }
     }
   }
+
   return ret;
 }
 
@@ -944,6 +946,7 @@ int ObPluginVectorIndexAdaptor::init_snap_data_without_lock(ObVectorIndexAlgorit
   ObVectorIndexParam *param = nullptr;
   const char* const DATATYPE_FLOAT32 = "float32";
   if (OB_FAIL(get_hnsw_param(param))) {
+
   } else if (!snap_data_->is_inited()) {
     if (OB_FAIL(snap_data_->mem_ctx_->init(parent_mem_ctx_, all_vsag_use_mem_))) {
     } else {
@@ -991,6 +994,7 @@ int ObPluginVectorIndexAdaptor::init_snap_data_without_lock(ObVectorIndexAlgorit
       }
     }
   }
+
   return ret;
 }
 

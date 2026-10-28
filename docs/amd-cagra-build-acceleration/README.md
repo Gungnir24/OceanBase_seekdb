@@ -281,3 +281,27 @@ QPS 在 646→850 之间跳动，同一配置重测能差 10% 以上，仍然是
 | `SEEKDB_CUVS_ADOPT=1` | 关 | 索引重载后认领构建期留下的 GPU 缓冲 |
 | `SEEKDB_BULK_BUILD=1` | 关 | 整表交给 VSAG 的 Build() 一次建图 |
 | `SEEKDB_BUILD_THREADS=N` | 不传 | 给 HNSW 传 build_thread_count |
+### 2.6 复现脚本默认就走 GPU 通路
+
+	ools/bench/amd_cagra_bench.py 在拉起 observer 时默认注入
+`SEEKDB_CUVS_GPU_ONLY=1` 和 `SEEKDB_CUVS_ADOPT=1`，所以直接跑脚本就是 GPU 独占
+路径；要对照纯 CPU 路径加 `--set-env SEEKDB_CUVS_GPU_ONLY=0 --set-env SEEKDB_CUVS_ADOPT=0`。
+
+用脚本默认值复测（无任何手工环境变量）：
+
+| 规模 | 构建 | 召回@10 | 召回@100 | QPS |
+|---|---|---|---|---|
+| 20k | 5.90 s | 1.000 | 0.9998 | 864 |
+| 100k | 7.0–10.2 s | 0.990 | 0.974 | 838 |
+
+（构建时间仍随宿主负载浮动 ±30%，100k 基线 53.3 s 是在同一台机器上量的。）
+
+### 2.7 试过但放弃：让"最小图"跟着 lib 走
+
+本来想让默认值自动区分 `lib=cuvs` 和 `lib=vsag`（只给 cuvs 索引建最小图），
+做法是在 adaptor 里按 `param->lib_` 设置一个 thread-local 标志。实测失败：
+DDL 侧第一次建索引时标志还是 false（写出 M=16 的索引），查询侧却按 M=4 反序列化，
+VSAG 直接 `fdeserialize error(type=12)`，整条查询链 retry 71 次后失败。
+
+根因是 lib 在 DDL 早期的 param 里还没落到 `VIAL_CUVS`。这个方向要做得干净得改
+参数传递链路，收益只是"少设一个环境变量"，所以回退，改为让复现脚本自带默认值。

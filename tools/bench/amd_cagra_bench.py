@@ -118,6 +118,12 @@ class Observer:
             # The accelerated bridge reports cuvs_build_us / cuvs_serve markers
             # only when timing is requested; the shipped one ignores this.
             env["SEEKDB_CUVS_TIMING"] = "1"
+        # The GPU-served build path is what this benchmark is about: keep the CPU
+        # index as bookkeeping only and let CAGRA serve the queries. Override with
+        # --set-env SEEKDB_CUVS_GPU_ONLY=0 / SEEKDB_CUVS_ADOPT=0 to compare with
+        # the pure CPU path.
+        env.setdefault("SEEKDB_CUVS_GPU_ONLY", "1")
+        env.setdefault("SEEKDB_CUVS_ADOPT", "1")
         for item in self.args.set_env:
             name, _, val = item.partition("=")
             env[name] = val
