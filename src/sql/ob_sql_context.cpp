@@ -161,6 +161,7 @@ ObSqlCtx::ObSqlCtx()
 
 void ObSqlCtx::reset()
 {
+  is_ai_column_nested_ = false;
   multi_stmt_item_.reset();
   session_info_ = NULL;
   schema_guard_ = NULL;

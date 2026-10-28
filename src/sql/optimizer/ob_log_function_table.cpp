@@ -80,6 +80,9 @@ int ObLogFunctionTable::get_plan_item_info(PlanText &plan_text,
   if (OB_FAIL(ObLogicalOperator::get_plan_item_info(plan_text, plan_item))) {
   } else if (OB_ISNULL(get_value_expr())) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (get_value_expr()->is_const_raw_expr() &&
+             get_value_expr()->get_expr_name() == ObString("__seekdb_file_scan_v1")) {
+    BUF_PRINT_STR("streaming local file", plan_item.special_predicates_, plan_item.special_predicates_len_);
   } else {
     BEGIN_BUF_PRINT;
     const ObRawExpr* value = get_value_expr();

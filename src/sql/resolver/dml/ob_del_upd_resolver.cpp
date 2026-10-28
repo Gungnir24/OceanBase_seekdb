@@ -129,7 +129,8 @@ int ObDelUpdResolver::resolve_assignments(const ParseNode &parse_node,
         ObRawExpr *expr = value_list.at(i);
         bool is_generated_column = true;
         // Mysql only allows updating generated columns to their default value
-        if (OB_FAIL(check_basic_column_generated(ref_expr, stmt, is_generated_column))) {
+        if (OB_FAIL(check_ai_column_write(ref_expr, stmt))) {
+        } else if (OB_FAIL(check_basic_column_generated(ref_expr, stmt, is_generated_column))) {
         } else {
           if (T_DEFAULT == expr->get_expr_type()) {
             ObDefaultValueUtils utils(stmt, &params_, this);
@@ -481,6 +482,73 @@ int ObDelUpdResolver::check_update_vector_col_with_vector_index(const ObTableSch
   return ret;
 }
 
+int ObDelUpdResolver::add_ai_column_assignments(ObIArray<ObTableAssignment> &assigns,
+    int64_t index, const TableItem &table, const ObTableSchema &schema)
+{
+  int ret = OB_SUCCESS;
+  if (!session_info_->is_user_session() && params_.query_ctx_->ai_retry_column_id_ == 0) { return ret; }
+  const int64_t user_assign_count = assigns.at(index).assignments_.count();
+  bool primary_key_changed = false;
+  for (int64_t i = 0; i < user_assign_count; ++i) {
+    const auto *col = schema.get_column_schema(assigns.at(index).assignments_.at(i).column_expr_->get_column_id());
+    if (col != nullptr && col->is_rowkey_column()) { primary_key_changed = true; }
+  }
+  for (auto it = schema.column_begin(); OB_SUCC(ret) && it != schema.column_end(); ++it) {
+    const ObColumnSchemaV2 *ai = *it;
+    if (ai == nullptr || !ai->is_ai_column()) { continue; }
+    bool changed = primary_key_changed || (params_.query_ctx_->ai_retry_table_id_ == schema.get_table_id()
+        && params_.query_ctx_->ai_retry_column_id_ == ai->get_column_id());
+    for (int64_t i = 0; !changed && i < user_assign_count; ++i) {
+      changed = ai->has_cascaded_column_id(assigns.at(index).assignments_.at(i).column_expr_->get_column_id());
+    }
+    if (!changed) { continue; }
+    const uint64_t ids[] = {ai->get_column_id(), static_cast<uint64_t>(ai->get_ai_state_column_id()),
+      static_cast<uint64_t>(ai->get_ai_request_column_id()), static_cast<uint64_t>(ai->get_ai_result_spec_column_id())};
+    for (int64_t j = 0; OB_SUCC(ret) && j < 4; ++j) {
+      const auto *col = schema.get_column_schema(ids[j]);
+      ObSEArray<ObColumnRefRawExpr *, 1> exprs;
+      ObAssignment assignment;
+      if (col == nullptr) { ret = OB_ERR_UNEXPECTED; }
+      else if (OB_FAIL(add_column_to_stmt(table, *col, exprs))) {
+      } else if (exprs.empty()) { ret = OB_ERR_UNEXPECTED; }
+      else {
+        assignment.column_expr_ = exprs.at(0);
+        assignment.is_implicit_ = true;
+        const ColumnItem *item = get_stmt()->get_column_item_by_id(table.table_id_, ids[j]);
+        if (j == 0) { ret = ObRawExprUtils::build_null_expr(*params_.expr_factory_, assignment.expr_); }
+        else if (j == 2) {
+          ObSysFunRawExpr *request = nullptr;
+          if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_FUN_SYS_UUID_SHORT, request))) {
+          } else {
+            request->set_func_name(ObString::make_string("uuid_short"));
+            assignment.expr_ = request;
+            ret = request->formalize(session_info_);
+          }
+        } else {
+          ObConstRawExpr *zero = nullptr;
+          if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_INT, zero))) {
+          } else {
+            ObObj value; value.set_int(j == 3 ? ai->get_ai_definition_version() : 0);
+            zero->set_value(value); zero->set_data_type(ObIntType); assignment.expr_ = zero;
+          }
+        }
+        if (OB_SUCC(ret)) { ret = add_assignment(assigns, &table, item, assignment); }
+      }
+    }
+    // Capture all inputs in the DML row projection; the worker never rereads
+    // mutable business input to build a request.
+    ObSEArray<uint64_t, 8> dependencies;
+    if (OB_SUCC(ret)) { ret = ai->get_cascaded_column_ids(dependencies); }
+    for (int64_t j = 0; OB_SUCC(ret) && j < dependencies.count(); ++j) {
+      ObSEArray<ObColumnRefRawExpr *, 1> exprs;
+      const auto *dep = schema.get_column_schema(dependencies.at(j));
+      if (dep == nullptr) { ret = OB_ERR_UNEXPECTED; }
+      else { ret = add_column_to_stmt(table, *dep, exprs); }
+    }
+  }
+  return ret;
+}
+
 int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment> &assigns,
                                                      const ObStmtScope scope)
 {
@@ -513,6 +581,7 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
       LOG_WARN("fail to get table schema", KPC(table_item), K(table_schema));
     } else if (OB_FAIL(table_schema->has_before_update_row_trigger(*schema_guard, trigger_exist))) {
     } else if (OB_FAIL(generate_wrapper_expr_for_assignemnts(assigns.at(i).assignments_, trigger_exist))) {
+    } else if (OB_FAIL(add_ai_column_assignments(assigns, i, *table_item, *table_schema))) {
     } else if (OB_FAIL(check_update_vector_col_with_vector_index(table_schema,
                                                                  schema_guard,
                                                                  assigns.at(i).assignments_,
@@ -1977,6 +2046,22 @@ int ObDelUpdResolver::build_column_conv_function_with_default_expr(ObInsertTable
                                                      true/*get_hidden*/))) {
     } else if (OB_ISNULL(col_schema)) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (col_schema->is_hidden() && [&]() {
+        bool request_column = false;
+        for (auto it = table_schema->column_begin(); it != table_schema->column_end(); ++it) {
+          request_column |= (*it)->is_ai_column() && (*it)->get_ai_request_column_id() == col_schema->get_column_id();
+        }
+        return request_column;
+      }()) {
+      // A volatile expression gives each request a writable datum that cannot
+      // alias a folded zero constant used by a business or status column.
+      ObSysFunRawExpr *request = nullptr;
+      if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_FUN_SYS_UUID_SHORT, request))) {
+      } else {
+        request->set_func_name(ObString::make_string("uuid_short"));
+        function_expr = request;
+        ret = request->formalize(session_info_);
+      }
     } else if (ObDomainIdUtils::is_domain_id_index_col(col_schema)) {
       if (OB_FAIL(copy_schema_expr(*params_.expr_factory_,
                                   column_item->expr_->get_dependant_expr(),
@@ -2223,6 +2308,9 @@ int ObDelUpdResolver::resolve_insert_columns(const ParseNode *node,
         }
       }
     }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < table_info.values_desc_.count(); ++i) {
+    ret = check_ai_column_write(table_info.values_desc_.at(i), del_upd_stmt);
   }
   return ret;
 }

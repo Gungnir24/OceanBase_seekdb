@@ -1035,6 +1035,27 @@ int ObSchemaRetrieveUtils::fill_column_schema(const bool check_deleted, T &resul
     EXTRACT_INT_FIELD_TO_CLASS_MYSQL_WITH_DEFAULT_VALUE(result, sub_data_type, column, int64_t, true, true, 0);
     EXTRACT_INT_FIELD_TO_CLASS_MYSQL_WITH_DEFAULT_VALUE(result, skip_index_attr, column, uint64_t , true, true, ObSkipIndexColumnAttr::OB_DEFAULT_SKIP_INDEX_COLUMN_ATTR);
     EXTRACT_INT_FIELD_TO_CLASS_MYSQL_WITH_DEFAULT_VALUE(result, lob_chunk_size, column, int64_t, true, true, OB_DEFAULT_LOB_CHUNK_SIZE);
+    {
+      ObString value;
+      EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "ai_expr", value, true, true, ObString());
+      if (OB_SUCC(ret)) { ret = column.set_ai_expr(value); }
+    }
+    {
+      ObString value;
+      EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "ai_normalized_expr", value, true, true, ObString());
+      if (OB_SUCC(ret)) { ret = column.set_ai_normalized_expr(value); }
+    }
+    {
+      ObString value;
+      EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "ai_dependencies", value, true, true, ObString());
+      if (OB_SUCC(ret)) { ret = column.set_ai_dependencies(value); }
+    }
+    EXTRACT_INT_FIELD_TO_CLASS_MYSQL_WITH_DEFAULT_VALUE(result, ai_max_retries, column, int64_t, true, true, 2);
+    EXTRACT_INT_FIELD_TO_CLASS_MYSQL_WITH_DEFAULT_VALUE(result, ai_definition_version, column, int64_t, true, true, 0);
+    EXTRACT_INT_FIELD_TO_CLASS_MYSQL_WITH_DEFAULT_VALUE(result, ai_state_column_id, column, int64_t, true, true, 0);
+    EXTRACT_INT_FIELD_TO_CLASS_MYSQL_WITH_DEFAULT_VALUE(result, ai_request_column_id, column, int64_t, true, true, 0);
+    EXTRACT_INT_FIELD_TO_CLASS_MYSQL_WITH_DEFAULT_VALUE(result, ai_result_spec_column_id, column, int64_t, true, true, 0);
+
 
     common::ColumnType default_type = column.get_data_type();
     if (column.is_generated_column()) {

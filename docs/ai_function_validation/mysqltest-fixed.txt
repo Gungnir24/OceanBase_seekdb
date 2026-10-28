@@ -1,0 +1,4 @@
+ai_function_enhancement: exit=0 ok
+ 
+ai_prompt: exit=0 ok
+ 

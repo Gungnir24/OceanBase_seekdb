@@ -1,0 +1,34 @@
+Running main() from gtest_main.cc
+[==========] Running 11 tests from 2 test cases.
+[----------] Global test environment set-up.
+[----------] 4 tests from AIPrompt
+[ RUN      ] AIPrompt.repeated_and_nested
+[       OK ] AIPrompt.repeated_and_nested (0 ms)
+[ RUN      ] AIPrompt.parameters_are_not_reparsed_as_templates
+[       OK ] AIPrompt.parameters_are_not_reparsed_as_templates (0 ms)
+[ RUN      ] AIPrompt.invalid_and_overflowing_index
+[       OK ] AIPrompt.invalid_and_overflowing_index (0 ms)
+[ RUN      ] AIPrompt.json_arrays_objects_unicode_and_escapes
+[       OK ] AIPrompt.json_arrays_objects_unicode_and_escapes (0 ms)
+[----------] 4 tests from AIPrompt (0 ms total)
+
+[----------] 7 tests from AIProtocols
+[ RUN      ] AIProtocols.embedding_restores_order
+[       OK ] AIProtocols.embedding_restores_order (0 ms)
+[ RUN      ] AIProtocols.rejects_malformed_embeddings
+[       OK ] AIProtocols.rejects_malformed_embeddings (0 ms)
+[ RUN      ] AIProtocols.ollama_native_protocol
+[       OK ] AIProtocols.ollama_native_protocol (0 ms)
+[ RUN      ] AIProtocols.empty_completion_is_invalid
+[       OK ] AIProtocols.empty_completion_is_invalid (0 ms)
+[ RUN      ] AIProtocols.rerank_stability_and_validation
+[       OK ] AIProtocols.rerank_stability_and_validation (0 ms)
+[ RUN      ] AIProtocols.retry_discards_partial_response
+[       OK ] AIProtocols.retry_discards_partial_response (3 ms)
+[ RUN      ] AIProtocols.retry_obeys_total_timeout
+[       OK ] AIProtocols.retry_obeys_total_timeout (0 ms)
+[----------] 7 tests from AIProtocols (3 ms total)
+
+[----------] Global test environment tear-down
+[==========] 11 tests from 2 test cases ran. (3 ms total)
+[  PASSED  ] 11 tests.

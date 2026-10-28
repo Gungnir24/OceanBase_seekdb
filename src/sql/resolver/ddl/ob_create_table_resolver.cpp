@@ -932,6 +932,24 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
       } else if (OB_FAIL(resolve_primary_key_node(*primary_node, stats))) {
       }
       if (OB_SUCC(ret)) {
+        // Resolve AI definitions after every ordinary/result column and the primary
+        // key are known, so forward dependencies cannot evade validation.
+        const int64_t user_column_count = table_schema.get_column_count();
+        for (int64_t ai_idx = 0; OB_SUCC(ret) && ai_idx < user_column_count; ++ai_idx) {
+          ObColumnSchemaV2 *ai_col = table_schema.get_column_schema_by_idx(ai_idx);
+          if (ai_col != nullptr && ai_col->is_ai_column()) {
+            ObSEArray<ObColumnSchemaV2, 3> hidden;
+            uint64_t max_id = cur_column_id_;
+            if (OB_FAIL(resolve_ai_column_definition(*ai_col, table_schema))) {
+            } else if (OB_FAIL(make_ai_hidden_columns(*ai_col, max_id, hidden))) {
+            } else {
+              cur_column_id_ = max_id;
+              for (int64_t j = 0; OB_SUCC(ret) && j < hidden.count(); ++j) {
+                ret = table_schema.add_column(hidden.at(j));
+              }
+            }
+          }
+        }
         table_schema.set_max_used_column_id(cur_column_id_);
         if (0 != autoinc_column_id) {
           table_schema.set_autoinc_column_id(autoinc_column_id);

@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "sql/engine/ai_column_strict.h"
+
 #define USING_LOG_PREFIX SQL
 #include "ob_result_set.h"
 #include "data_plane/transaction/ob_tx_desc_access.h"
@@ -462,6 +464,7 @@ OB_INLINE int ObResultSet::do_open_plan(ObExecContext &ctx)
 
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(start_stmt())) {
+  } else if (OB_FAIL(ai_column_strict::check(ctx, physical_plan_->ai_column_refs_))) {
   } else {
     /* Set exec_result_ to the executor's runtime environment for returning data */
     /* execute plan,

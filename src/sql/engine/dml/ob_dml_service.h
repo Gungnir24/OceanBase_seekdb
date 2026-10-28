@@ -31,6 +31,7 @@ class ObTableModifyOp;
 class ObDMLService
 {
 public:
+  static int process_ai_columns(const ObDMLBaseCtDef &ctdef, ObTableModifyOp &op);
   static bool check_cascaded_reference(const ObExpr *expr, const ObExprPtrIArray &row);
 
   static int check_row_null(const ObExprPtrIArray &row,

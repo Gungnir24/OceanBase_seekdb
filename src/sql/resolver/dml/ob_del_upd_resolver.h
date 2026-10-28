@@ -172,6 +172,8 @@ protected:
   int generate_autoinc_params(ObInsertTableInfo &table_info);
   int get_value_row_size(uint64_t &count);
 
+  int add_ai_column_assignments(common::ObIArray<ObTableAssignment> &assigns, int64_t index,
+                                const TableItem &table, const share::schema::ObTableSchema &schema);
   int resolve_insert_columns(const ParseNode *node,
                              ObInsertTableInfo& table_info);
   int resolve_insert_values(const ParseNode *node,

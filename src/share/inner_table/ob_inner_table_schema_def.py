@@ -342,7 +342,15 @@ all_column_def = dict(
       ('sub_data_type', 'int', 'false', '0'),
       ('skip_index_attr', 'int', 'false', '0'),
       ('lob_chunk_size', 'int', 'false', 'OB_DEFAULT_LOB_CHUNK_SIZE'),
-      ('local_session_vars', 'longtext', 'true')
+      ('local_session_vars', 'longtext', 'true'),
+      ('ai_expr', 'longtext', 'true'),
+      ('ai_normalized_expr', 'longtext', 'true'),
+      ('ai_dependencies', 'longtext', 'true'),
+      ('ai_max_retries', 'int', 'false', 2),
+      ('ai_definition_version', 'int', 'false', 0),
+      ('ai_state_column_id', 'int', 'false', 0),
+      ('ai_request_column_id', 'int', 'false', 0),
+      ('ai_result_spec_column_id', 'int', 'false', 0)
   ]
   )
 
@@ -2466,6 +2474,33 @@ all_objauth_mysql_def = dict(
   )
 def_table_schema(**all_objauth_mysql_def)
 def_table_schema(**gen_history_table_def(1134, all_objauth_mysql_def))
+
+# Transactional outbox. Every task in a row-generation group shares request_id.
+def_table_schema(
+  owner='ai_column', table_name='__all_ai_column_task', table_id='1135',
+  table_type='SYSTEM_TABLE', gm_columns=['gmt_create', 'gmt_modified'],
+  is_cluster_private=False, meta_record_in_sys=False,
+  rowkey_columns=[('table_id', 'int'), ('column_id', 'int'), ('request_id', 'int')],
+  normal_columns=[
+    ('definition_version', 'int', 'false', 1),
+    ('state', 'int', 'false', 0),
+    ('retry_count', 'int', 'false', 0),
+    ('max_retries', 'int', 'false', 2),
+    ('eligible_ts', 'timestamp', 'true'),
+    ('lease_owner', 'int', 'false', 0),
+    ('lease_until', 'int', 'false', 0),
+    ('rowkey_predicate', 'longtext', 'false'),
+    ('target_table', 'varchar:1024', 'false'),
+    ('result_column', 'varchar:512', 'false'),
+    ('state_column', 'varchar:512', 'false'),
+    ('request_column', 'varchar:512', 'false'),
+    ('spec_column', 'varchar:512', 'false'),
+    ('input_sql', 'longtext', 'false'),
+    ('result_sql', 'longtext', 'true'),
+    ('last_error', 'int', 'false', 0)
+  ]
+)
+
 
 
 # Reserved position (placeholder before this line)
@@ -14455,3 +14490,19 @@ def_sys_index_table(
 # Agent table Index
 # End Agent table Index
 ################################################################################
+
+# AI metadata is part of __all_column and its history, so physical schema and
+# generation rules commit together. This view exposes only AI result columns.
+def_table_schema(
+  owner='ai_column', table_name='__all_ai_column', table_id='21680',
+  table_type='SYSTEM_VIEW', rowkey_columns=[], normal_columns=[], gm_columns=[],
+  view_definition="""
+    SELECT table_id, column_id, column_name, ai_expr AS expression,
+           ai_normalized_expr AS normalized_expr, ai_dependencies AS dependency_column_ids,
+           'async' AS sync_mode, ai_max_retries AS max_retries,
+           ai_definition_version AS definition_version,
+           ai_state_column_id AS state_column_id, ai_request_column_id AS request_column_id,
+           ai_result_spec_column_id AS result_spec_column_id
+    FROM oceanbase.__all_column WHERE ai_expr IS NOT NULL AND ai_expr <> ''
+  """.replace("\n", " ")
+)

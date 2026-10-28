@@ -18,6 +18,7 @@
 #define SRC_SQL_ENGINE_BASIC_OB_SELECT_INTO_OP_H_
 
 #include "sql/engine/ob_operator.h"
+#include "sql/engine/basic/file_sql_copy.h"
 #include "lib/file/ob_file.h"
 #include "sql/engine/cmd/ob_load_data_parser.h"
 #include "sql/engine/basic/ob_select_into_basic.h"
@@ -264,6 +265,9 @@ private:
   bool file_need_split(int64_t file_size);
 
 private:
+  int copy_file_rows();
+  file_sql::CopyWriter *file_copy_ = nullptr;
+  bool file_copy_finished_ = false;
   int64_t top_limit_cnt_;
   bool is_first_;
   ObObj field_str_;

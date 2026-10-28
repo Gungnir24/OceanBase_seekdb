@@ -1,0 +1,76 @@
+# Run from tools/deploy with mysqltest --test-file pointing to this file.
+# Regression coverage for request datum aliasing, schema cache copies, long LOB
+# input snapshots, column-wide strict checks, and explicit result protection.
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py start 19125
+--disable_warnings
+DROP DATABASE IF EXISTS ai_column_regression;
+--enable_warnings
+CREATE DATABASE ai_column_regression;
+--error 0,11112
+CALL DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ai_column_regression_ep');
+--error 0,11118
+CALL DBMS_AI_SERVICE.DROP_AI_MODEL('ai_column_regression_model');
+CALL DBMS_AI_SERVICE.CREATE_AI_MODEL('ai_column_regression_model', '{"type":"completion","model_name":"mock-complete"}');
+CALL DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('ai_column_regression_ep', '{"ai_model_name":"ai_column_regression_model","url":"http://127.0.0.1:19125/v1/chat/completions","access_key":"test-only","provider":"openai","request_model_name":"mock-complete"}');
+CREATE TABLE ai_column_regression.docs (
+  id BIGINT PRIMARY KEY,
+  zero_value BIGINT DEFAULT 0,
+  body LONGTEXT,
+  answer LONGTEXT AI COLUMN (AI_COMPLETE('ai_column_regression_model', body)) WITH (sync_mode='async', max_retries=0)
+);
+ALTER TABLE ai_column_regression.docs ADD COLUMN extra INT DEFAULT 0;
+INSERT INTO ai_column_regression.docs(id, body) VALUES (0, REPEAT('x',20000)), (1, NULL);
+let $attempts = 150;
+let $ready = 0;
+while ($attempts)
+{
+  let $ready = `SELECT COUNT(*)=1 FROM ai_column_regression.docs WHERE id=0 AND CHAR_LENGTH(answer)=20005 AND NOT EXISTS (SELECT 1 FROM oceanbase.__all_ai_column_task WHERE table_id IN (SELECT table_id FROM oceanbase.__all_table WHERE table_name='docs' AND database_id IN (SELECT database_id FROM oceanbase.__all_database WHERE database_name='ai_column_regression')))`;
+  if ($ready) { let $attempts = 0; }
+  if ($ready == 0) { --real_sleep 0.1
+    dec $attempts; }
+}
+if ($ready == 0) { die Long LOB input was not generated correctly; }
+let $ok = `SELECT COUNT(*)=2 FROM ai_column_regression.docs WHERE zero_value=0 AND extra=0`;
+if ($ok == 0) { die AI request ID modified an unrelated zero-valued datum; }
+SET SESSION ai_column_strict_read=ON;
+# Existing AI_COMPLETE rejects a NULL input: completion is FAILED, not READY.
+--error 11120
+SELECT id, answer IS NULL FROM ai_column_regression.docs ORDER BY id;
+# Even a predicate excluding the failed row must fail the column-wide check.
+--error 11120
+SELECT answer FROM ai_column_regression.docs WHERE id=0;
+DELETE FROM ai_column_regression.docs WHERE id=1;
+SELECT id, answer IS NULL FROM ai_column_regression.docs ORDER BY id;
+SET SESSION ai_column_strict_read=OFF;
+--error 1235
+UPDATE ai_column_regression.docs SET answer='overwrite' WHERE id=0;
+--error 1235
+INSERT INTO ai_column_regression.docs(id, body, answer) VALUES(2,'input','overwrite');
+# ADD on a nonempty table must schedule the preexisting rows too.
+CREATE TABLE ai_column_regression.backfill (id INT PRIMARY KEY, body VARCHAR(100));
+INSERT INTO ai_column_regression.backfill VALUES (1,'before-add'),(2,'also-before');
+ALTER TABLE ai_column_regression.backfill ADD answer VARCHAR(200)
+  AI COLUMN (AI_COMPLETE('ai_column_regression_model', body)) WITH (sync_mode='async');
+let $attempts = 150;
+let $ready = 0;
+while ($attempts)
+{
+  let $ready = `SELECT COUNT(*)=2 FROM ai_column_regression.backfill WHERE answer=CONCAT('mock:',body)`;
+  if ($ready) { let $attempts = 0; }
+  if ($ready == 0) { --real_sleep 0.1
+    dec $attempts; }
+}
+if ($ready == 0) { die ADD AI COLUMN did not backfill existing rows; }
+DROP TABLE ai_column_regression.backfill;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py stop 19125
+ALTER TABLE ai_column_regression.docs RETRY AI COLUMN answer WHERE id=0;
+SET SESSION ai_column_strict_read=ON;
+--error 11120
+SELECT answer FROM ai_column_regression.docs WHERE 0;
+--error 11120
+SELECT COUNT(answer) FROM ai_column_regression.docs LIMIT 0;
+SELECT id FROM ai_column_regression.docs WHERE 0;
+SET SESSION ai_column_strict_read=OFF;
+DROP DATABASE ai_column_regression;
+CALL DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ai_column_regression_ep');
+CALL DBMS_AI_SERVICE.DROP_AI_MODEL('ai_column_regression_model');

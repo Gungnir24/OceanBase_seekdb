@@ -94,6 +94,7 @@
 #include "sql/resolver/cmd/ob_get_diagnostics_resolver.h"
 #include "sql/resolver/dcl/ob_alter_role_resolver.h"
 #include "sql/pl/ob_pl_package.h"
+#include "sql/resolver/ai_column_retry.h"
 
 namespace oceanbase
 {
@@ -181,7 +182,9 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
         break;
       }
       case T_ALTER_TABLE: {
-        REGISTER_STMT_RESOLVER(AlterTable);
+        bool retry = false;
+        ret = ai_column_retry::resolve(params_, *real_parse_tree, stmt, retry);
+        if (OB_SUCC(ret) && !retry) { REGISTER_STMT_RESOLVER(AlterTable); }
         break;
       }
       case T_CREATE_INDEX: {
@@ -401,6 +404,7 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       case T_SHOW_TABLES:
       case T_SHOW_DATABASES:
       case T_SHOW_VARIABLES:
+      case T_SHOW_AI_COLUMNS:
       case T_SHOW_COLUMNS:
       case T_SHOW_SCHEMA:
       case T_SHOW_CREATE_DATABASE:

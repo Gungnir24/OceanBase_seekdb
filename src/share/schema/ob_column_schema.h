@@ -66,6 +66,26 @@ bool operator!=(const ObColumnSchemaV2 &r) const;
 
 int assign(const ObColumnSchemaV2 &src_schema);
 
+
+  // Asynchronous generated columns are stored values, not SQL generated columns.
+  bool is_ai_column() const { return !ai_expr_.empty(); }
+  const common::ObString &get_ai_expr() const { return ai_expr_; }
+  int set_ai_expr(const common::ObString &value) { return deep_copy_str(value, ai_expr_); }
+  const common::ObString &get_ai_normalized_expr() const { return ai_normalized_expr_; }
+  int set_ai_normalized_expr(const common::ObString &value) { return deep_copy_str(value, ai_normalized_expr_); }
+  const common::ObString &get_ai_dependencies() const { return ai_dependencies_; }
+  int set_ai_dependencies(const common::ObString &value);
+  int64_t get_ai_max_retries() const { return ai_max_retries_; }
+  void set_ai_max_retries(int64_t value) { ai_max_retries_ = value; }
+  int64_t get_ai_definition_version() const { return ai_definition_version_; }
+  void set_ai_definition_version(int64_t value) { ai_definition_version_ = value; }
+  int64_t get_ai_state_column_id() const { return ai_state_column_id_; }
+  void set_ai_state_column_id(int64_t value) { ai_state_column_id_ = value; }
+  int64_t get_ai_request_column_id() const { return ai_request_column_id_; }
+  void set_ai_request_column_id(int64_t value) { ai_request_column_id_ = value; }
+  int64_t get_ai_result_spec_column_id() const { return ai_result_spec_column_id_; }
+  void set_ai_result_spec_column_id(int64_t value) { ai_result_spec_column_id_ = value; }
+
 //set methods
   
   inline void set_table_id(const uint64_t id) { table_id_ = id; }
@@ -398,6 +418,15 @@ private:
   ObSkipIndexColumnAttr skip_index_attr_;
   int64_t lob_chunk_size_;
   share::ObLocalSessionVar local_session_vars_;
+  common::ObString ai_expr_;
+  common::ObString ai_normalized_expr_;
+  common::ObString ai_dependencies_;
+  int64_t ai_max_retries_;
+  int64_t ai_definition_version_;
+  int64_t ai_state_column_id_;
+  int64_t ai_request_column_id_;
+  int64_t ai_result_spec_column_id_;
+
 };
 
 inline int32_t ObColumnSchemaV2::get_data_length() const

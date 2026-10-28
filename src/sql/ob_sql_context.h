@@ -400,6 +400,8 @@ struct ObSqlPlanKey
 
 struct ObSqlCtx
 {
+  bool is_ai_column_nested_ = false;
+
   OB_UNIS_VERSION(1);
 public:
   ObSqlCtx();
@@ -568,6 +570,7 @@ public:
       all_user_variable_(),
       need_match_all_params_(false),
       has_udf_(false),
+      has_file_sql_(false),
       disable_udf_parallel_(false),
       has_is_table_(false),
       reference_obj_tables_(),
@@ -611,6 +614,8 @@ public:
     need_match_all_params_= false;
     has_udf_ = false;
     disable_udf_parallel_ = false;
+    has_file_sql_ = false;
+    ai_retry_table_id_ = ai_retry_column_id_ = 0;
     has_is_table_ = false;
     sql_schema_guard_.reset();
     reference_obj_tables_.reset();
@@ -701,6 +706,9 @@ public:
   common::hash::ObHashMap<uint64_t, ObObj, common::hash::NoPthreadDefendMode> calculable_expr_results_;
   bool need_match_all_params_; //only used for matching plans
   bool has_udf_;
+  uint64_t ai_retry_table_id_ = 0;
+  uint64_t ai_retry_column_id_ = 0;
+  bool has_file_sql_; // Dynamic file schemas must not enter the plan cache.
   bool disable_udf_parallel_; //used to deterministic pl udf parallel execute
   bool has_is_table_; // used to mark query has information schema table
   ObSqlSchemaGuard sql_schema_guard_;
