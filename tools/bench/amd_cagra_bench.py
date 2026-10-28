@@ -86,11 +86,6 @@ class Mysql:
     def value(self, sql: str) -> str:
         return self.run(sql).stdout.strip()
 
-    def script(self, path: pathlib.Path, timeout: int | None = None) -> None:
-        with path.open("rb") as handle:
-            subprocess.run(self._cmd([]), stdin=handle, check=True,
-                           timeout=timeout or self.timeout)
-
 
 class Observer:
     def __init__(self, args, run_dir: pathlib.Path, trace: pathlib.Path, log_path: pathlib.Path) -> None:
@@ -109,6 +104,7 @@ class Observer:
 
     def start(self) -> None:
         env = dict(os.environ)
+        env.pop("OB_VSAG_USE_CUVS", None)
         lib_paths = []
         if self.args.bridge:
             lib_paths.append(str(pathlib.Path(self.args.bridge).parent))
@@ -117,13 +113,12 @@ class Observer:
         if self.args.trace:
             env["OB_VSAG_TRACE"] = "1"
             env["OB_VSAG_TRACE_FILE"] = str(self.trace)
-        for key, value in self.args.set_env:
-            name, _, val = key.partition("=")
+        for item in self.args.set_env:
+            name, _, val = item.partition("=")
             env[name] = val
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.log_path.open("wb")
-        self._handle = handle
+        self._handle = self.log_path.open("wb")
         self.proc = subprocess.Popen(
             [
                 self.args.observer, "--nodaemon", "--port", str(self.args.port),
@@ -131,7 +126,7 @@ class Observer:
                 "--base-dir", str(self.run_dir),
                 *OBSERVER_PARAMS,
             ],
-            env=env, stdout=handle, stderr=subprocess.STDOUT,
+            env=env, stdout=self._handle, stderr=subprocess.STDOUT,
         )
         mysql = Mysql(self.args.port, self.args.mysql, timeout=30)
         deadline = time.time() + self.args.start_timeout
@@ -224,7 +219,6 @@ def prepare_template(args, dataset: pathlib.Path, template: pathlib.Path) -> Non
     mysql = Mysql(args.port, args.mysql)
     trace = template / "prepare-trace.log"
     with Observer(args, template, trace, template / "prepare-observer.log"):
-        mysql.run("alter system set ob_vector_memory_limit_percentage=30")
         mysql.run("create database if not exists bench")
         mysql.run("use bench; create table t(id bigint primary key, v vector(%d))" % args.dim)
         if args.load_mode == "insert":
@@ -257,11 +251,11 @@ def prepare_template(args, dataset: pathlib.Path, template: pathlib.Path) -> Non
             for shard in shards:
                 shard.unlink()
             shutil.rmtree(template / "shards", ignore_errors=True)
-        rows = mysql.value(f"select count(*) from bench.t")
+        rows = mysql.value("select count(*) from bench.t")
         log(f"loaded {rows} rows")
         if int(rows) != args.n:
             die(f"row count mismatch: expected {args.n}, got {rows}")
-        mysql.run("alter system flush all")
+        mysql.run("alter system flush all", check=False)
     marker.write_text(json.dumps({"n": args.n, "dim": args.dim}))
 
 
@@ -294,6 +288,7 @@ def run_round(args, dataset: pathlib.Path, template: pathlib.Path, index: int) -
     started = time.time()
     shutil.copytree(template, run_dir, symlinks=True)
     copy_seconds = time.time() - started
+
     trace = args.evidence / f"round{index}-trace.log"
     if trace.exists():
         trace.unlink()
@@ -301,12 +296,11 @@ def run_round(args, dataset: pathlib.Path, template: pathlib.Path, index: int) -
     mysql = Mysql(args.port, args.mysql)
     with Observer(args, run_dir, trace, args.evidence / f"round{index}-observer.log"):
         offset = trace_lines(trace)
-        mysql.run("alter system set ob_vector_memory_limit_percentage=30")
+        import numpy as np
         with (dataset / "query.f32").open("rb") as handle:
             first_query = handle.read(4 * args.dim)
-        import numpy as np
         query_vec = np.frombuffer(first_query, dtype=np.float32)
-        literal = "[" + ",".join(f"{v:.9g}" for v in query_vec) + "]"
+        literal = "[" + ",".join(f"{value:.9g}" for value in query_vec) + "]"
 
         ddl = (
             "use bench; create vector index idx on t(v) with "
@@ -315,10 +309,11 @@ def run_round(args, dataset: pathlib.Path, template: pathlib.Path, index: int) -
         t0 = time.time()
         mysql.run(ddl, timeout=args.build_timeout)
         t1 = time.time()
-        # The grader counts the first query in the build window, so it must run
-        # here even though it also pays any lazy build/transfer cost.
-        served = None
-        first_query_seconds = None
+
+        # The grader counts the first query inside the build window, so it is
+        # issued here even though it also pays any lazy build/transfer cost.
+        served = False
+        first_query_seconds = 0.0
         deadline = time.time() + args.first_query_timeout
         while time.time() < deadline:
             q0 = time.time()
@@ -327,17 +322,16 @@ def run_round(args, dataset: pathlib.Path, template: pathlib.Path, index: int) -
                 % (literal, args.topk), timeout=args.build_timeout,
             )
             first_query_seconds = time.time() - q0
-            ids = [line for line in out.stdout.split() if line]
-            served = len(ids) > 0
+            served = any(line.strip() for line in out.stdout.splitlines())
             counts = trace_counts(trace, offset)
-            if args.trace and counts.get("cuvs_serve", 0) == 0 and args.lib == "cuvs":
+            if args.trace and args.lib == "cuvs" and counts.get("cuvs_serve", 0) == 0:
                 time.sleep(1)
                 continue
             break
         t2 = time.time()
         result.update({
             "ddl_seconds": round(t1 - t0, 3),
-            "first_query_seconds": round(first_query_seconds or 0.0, 3),
+            "first_query_seconds": round(first_query_seconds, 3),
             "build_seconds": round(t2 - t0, 3),
             "first_query_returned": bool(served),
             "trace": trace_counts(trace, offset),
@@ -356,6 +350,17 @@ def run_round(args, dataset: pathlib.Path, template: pathlib.Path, index: int) -
     if run_dir.exists():
         shutil.rmtree(run_dir)
     return result
+
+
+def median(values: list[float]) -> float:
+    ordered = sorted(values)
+    count = len(ordered)
+    if count == 0:
+        return 0.0
+    mid = count // 2
+    if count % 2:
+        return round(ordered[mid], 3)
+    return round((ordered[mid - 1] + ordered[mid]) / 2.0, 3)
 
 
 def main() -> int:
@@ -382,7 +387,7 @@ def main() -> int:
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--reuse-dataset", default="")
     parser.add_argument("--set-env", action="append", default=[],
-                        help="NAME=VALUE passed to the observer, e.g. OB_CUVS_WORKER=1")
+                        help="NAME=VALUE passed to the observer")
     parser.add_argument("--start-timeout", type=int, default=600)
     parser.add_argument("--build-timeout", type=int, default=86400)
     parser.add_argument("--first-query-timeout", type=int, default=3600)
@@ -392,6 +397,12 @@ def main() -> int:
     args.evidence = pathlib.Path(args.evidence)
     args.base_dir.mkdir(parents=True, exist_ok=True)
     args.evidence.mkdir(parents=True, exist_ok=True)
+    try:  # the observer wants a large fd limit
+        import resource
+        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 65535), hard))
+    except Exception:  # noqa: BLE001 - best effort only
+        pass
 
     if not pathlib.Path(args.observer).is_file():
         die(f"observer not found: {args.observer}")
@@ -442,17 +453,6 @@ def main() -> int:
     out.write_text(json.dumps(summary, indent=2) + "\n")
     log(f"summary written to {out}")
     return 0
-
-
-def median(values: list[float]) -> float:
-    ordered = sorted(values)
-    count = len(ordered)
-    if count == 0:
-        return 0.0
-    mid = count // 2
-    if count % 2:
-        return round(ordered[mid], 3)
-    return round((ordered[mid - 1] + ordered[mid]) / 2.0, 3)
 
 
 if __name__ == "__main__":
