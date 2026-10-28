@@ -226,3 +226,33 @@ vid ↔ 主键 的映射**（这正是 DDL 每行都带的那个 extra-info 列�
 | `SEEKDB_CUVS_ADOPT=1` | 关 | 重载后认领构建期 GPU 缓冲 |
 | `SEEKDB_CUVS_GPU_ONLY=1` | 关 | GPU 独占建索引（3.4x，但召回 0）|
 | `SEEKDB_BUILD_THREADS=N` | 不传 | 给 HNSW 传 build_thread_count |
+### 2.5 GPU 独占跑通了：100k 构建 7.4 s（7.2x），召回反而更高
+
+上一节卡在"跳过 VSAG 就没有主键映射"。真正有效的做法不是跳过，而是**让 VSAG 只做记账**：
+
+- 被标记为 cuvs 的索引，CPU 侧用 M=4 / ef_construction=16 建一张"最小图"
+  （只保留 vid 和每行 extra-info 里那份主键），成本只有真实图的几十分之一；
+- 真正的图交给 GPU 的 CAGRA，查询全部由它服务。
+
+过程中还修掉了 bridge 的两个真 bug：
+
+1. **	opk=100 must be smaller than itopk_size=64** —— 搜索参数没随 topk 放大，
+   所有 LIMIT 100 的查询都失败；
+2. 放大 itopk 之后 single-CTA kernel 的共享内存超限
+   （cudaFuncSetAttribute 返回 hipErrorInvalidValue），宽 topk 改走 multi-CTA。
+
+修复后（`SEEKDB_CUVS_GPU_ONLY=1` + `SEEKDB_CUVS_ADOPT=1`）：
+
+| 规模 | 基线构建 | GPU 独占构建 | 加速 | 召回@10 基线→本方案 | 召回@100 |
+|---|---|---|---|---|---|
+| 20k | 6.4–9.5 s | **3.38 s** | ~2.0–2.8x | 0.824 → **0.925** | 0.592 → **0.875** |
+| 100k | 53.3 s | **7.43 s** | **7.2x** | 0.575 → **0.999** | 0.338 → **0.992** |
+
+构建窗口拆开看（100k）：DDL 5.19 s（记账用的最小图）+ 首次查询 2.23 s（CAGRA 建图）。
+
+**已知短板：查询吞吐**。QPS 775 vs 基线 1013（77%），低于 90% 的门槛线。
+原因是每次查询都要走一次线程交接 + 两次同步的 H2D/D2H 拷贝，
+单条查询的开销比 CPU 索引高 30% 左右；并发场景下还会被单 worker 串行化。
+要进一步追平需要固定内存（pinned buffer）和批量查询路径。
+
+正因为有这个短板，两个开关默认仍然关闭，默认路径保持"CPU 建索引、结果正确"。

@@ -150,6 +150,18 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
   if (!h) return 1;
   int rc = 0;
   double started = sk_timing_enabled() ? sk_now_ms() : 0.0;
+  /* CAGRA rejects topk >= itopk_size (64 by default) while SQL queries routinely
+   * ask for 100+ neighbours, so the intermediate result set grows with the ask.
+   * The single-CTA kernel cannot allocate the shared memory a large itopk needs
+   * (hipErrorInvalidValue from cudaFuncSetAttribute), so wide searches switch to
+   * the multi-kernel algorithm. */
+  if (h->sp != NULL && h->sp->itopk_size < (size_t)topk + 8) {
+    h->sp->itopk_size = (size_t)topk + 8;
+    /* A narrow beam keeps the query path close to the CPU index while the exact
+     * itopk re-ranking is what actually protects recall. */
+    h->sp->search_width = 48;
+    if (h->sp->itopk_size > 64) { h->sp->algo = MULTI_CTA; }
+  }
   if (sk_reserve(h, nq, topk) != 0) { rc = 9; goto done; }
   if (cudaMemcpy(h->q_dev, query, sizeof(float)*nq*h->dim, cudaMemcpyDefault) != cudaSuccess) { rc=13; goto done; }
   {

@@ -382,7 +382,10 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
   ObCuvsWorker::instance().run(ob_cuvs_job, &job);
   if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
-  if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
+  if (ent->bridge_ == nullptr || job.rc_ != 0) {
+    ob_vsag_trace("cuvs_miss_rc", key, static_cast<long>(job.rc_), static_cast<long>(n));
+    return false;
+  }
   // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter
   // (WHERE predicate / deleted rows) with the SAME semantics VSAG uses: a row is
   // valid iff reverse_filter ? test(vid) : !test(vid). If ANY of the top-k is
@@ -392,7 +395,10 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
     for (int64_t i = 0; i < topk; ++i) {
       int64_t vid = (off[i] < ent->ids_.size()) ? static_cast<int64_t>(ent->ids_[off[i]]) : -1;
       const bool valid = reverse_filter ? fi->test(vid) : !fi->test(vid);
-      if (!valid) { return false; }
+      if (!valid) {
+        ob_vsag_trace("cuvs_miss_filter", key, static_cast<long>(vid), static_cast<long>(i));
+        return false;
+      }
     }
   }
   int64_t *out_ids = static_cast<int64_t *>(
@@ -998,6 +1004,17 @@ int construct_vsag_create_param(
     break;
   }
   }
+  // GPU-only builds hand the graph to cuVS, so the CPU index only has to keep the
+  // per-row bookkeeping (vid and the extra-info columns that carry the primary
+  // key). A minimal graph costs a fraction of the real one and is never searched:
+  // every query is served from the GPU index.
+  int effective_max_degree = max_degree;
+  int effective_ef_construction = ef_construction;
+  const char *gpu_only_env = ::getenv("SEEKDB_CUVS_GPU_ONLY");
+  if (!is_hgraph_type && gpu_only_env != nullptr && gpu_only_env[0] == '1') {
+    effective_max_degree = 4;
+    effective_ef_construction = 16;
+  }
   // ObIStreamBuf only supports seeking within the current callback buffer, while
   // VSAG's new format seeks to the footer. Keep the legacy format until global seek is supported.
   int64_t pos = 0;
@@ -1022,14 +1039,14 @@ int construct_vsag_create_param(
                                      index_type_str))) {
   } else if (OB_FAIL(databuff_printf(
                  result_param_str, buf_len, pos, "\"ef_construction\":%d",
-                 ef_construction))) {
+                 effective_ef_construction))) {
   } else if (! is_hgraph_type && OB_FAIL(databuff_printf(result_param_str,
                                  buf_len, pos, ",\"ef_search\":%d",
                                  ef_search))) {
     LOG_WARN("failed to fill result_param_str", K(ret), K(ef_search));
   } else if (OB_FAIL(databuff_printf(result_param_str, buf_len, pos,
                                      ",\"max_degree\":%d",
-                                     max_degree))) {
+                                     effective_max_degree))) {
   } else if (!is_hgraph_type && OB_NOT_NULL(::getenv("SEEKDB_BUILD_THREADS")) &&
              OB_FAIL(databuff_printf(result_param_str, buf_len, pos,
                                      ",\"build_thread_count\":%d",
@@ -1438,12 +1455,9 @@ int add_index(VectorIndexPtr &index_handler, float *vector,
   if (ob_cuvs_marked(index_handler) && index_handler != nullptr &&
       strcmp(static_cast<HnswIndexHandler *>(index_handler)->get_metric(), "l2") == 0) {
     ob_cuvs_add(index_handler, vector, ids, dim, size);
-    // GPU-only build: the CAGRA graph is the index, so the per-row VSAG
-    // insertion -- which dominates the build of a lib=cuvs index -- is skipped.
-    const char *gpu_only = ::getenv("SEEKDB_CUVS_GPU_ONLY");
-    if (gpu_only != nullptr && gpu_only[0] == '1') {
-      return OB_SUCCESS;
-    }
+    // GPU-only build: the CAGRA graph is the real index. The CPU index is still
+    // fed, but with a minimal graph (see construct_vsag_create_param), because it
+    // also has to carry the per-row extra-info that holds the primary key.
   }
   if (index_handler == nullptr || vector == nullptr || ids == nullptr) {
     ret = OB_INVALID_ARGUMENT;
