@@ -612,10 +612,6 @@ int ObPluginVectorIndexAdaptor::set_param(ObString init_str, int64_t dim)
     algo_data_ = hnsw_param;
     hnsw_param->dim_ = dim;
     LOG_INFO("init vector index adapter with param", KPC(hnsw_param)); // change log to debug level later
-    LOG_WARN_RET(OB_SUCCESS, "[CUVSPROBE] set_param", K(init_str),
-                 "lib", static_cast<int>(hnsw_param->lib_),
-                 "type", static_cast<int>(hnsw_param->type_),
-                 "dist", static_cast<int>(hnsw_param->dist_algorithm_));
   }
 
   if (OB_FAIL(ret)) {
@@ -1447,12 +1443,7 @@ static inline void ob_mark_cuvs_if_needed(void *algo_data, void *handle)
       && param->dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_L2
       && (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW
           || param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH)) {
-    oceanbase::common::obvsag::mark_cuvs_index(handle);
-  } else if (param != nullptr && param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS) {
-    LOG_WARN_RET(OB_SUCCESS, "[CUVSPROBE] not marked", KP(handle),
-                 "type", static_cast<int>(param->type_),
-                 "dist", static_cast<int>(param->dist_algorithm_));
-  }
+    oceanbase::common::obvsag::mark_cuvs_index(handle);\n  }
 }
 
 int ObPluginVectorIndexAdaptor::insert_rows(blocksstable::ObDatumRow *rows,
