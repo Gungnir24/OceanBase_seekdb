@@ -61,6 +61,8 @@ int ObAiService::init()
 
 void ObAiService::destroy()
 {
+  worker_.stop();
+  worker_.wait();
   is_inited_ = false;
 }
 
@@ -149,3 +151,5 @@ int ObAiServiceGuard::get_ai_endpoint_by_ai_model_name(const common::ObString &a
 
 } // namespace omt
 } // namespace oceanbase
+
+#include "observer/omt/ob_ai_column_worker.ipp"

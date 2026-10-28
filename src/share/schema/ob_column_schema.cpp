@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "ob_column_schema.h"
 #include "share/schema/ob_schema_service.h"
+#include "lib/string/ob_sql_string.h"
 
 namespace oceanbase
 {
@@ -77,11 +78,20 @@ int ObColumnSchemaV2::assign(const ObColumnSchemaV2 &src_schema)
     sub_type_ = src_schema.sub_type_;
     skip_index_attr_ = src_schema.skip_index_attr_;
     lob_chunk_size_ = src_schema.lob_chunk_size_;
+    ai_max_retries_ = src_schema.ai_max_retries_;
+    ai_definition_version_ = src_schema.ai_definition_version_;
+    ai_state_column_id_ = src_schema.ai_state_column_id_;
+    ai_request_column_id_ = src_schema.ai_request_column_id_;
+    ai_result_spec_column_id_ = src_schema.ai_result_spec_column_id_;
+
 
     if (OB_FAIL(deep_copy_obj(src_schema.orig_default_value_, orig_default_value_))) {
     } else if (OB_FAIL(deep_copy_obj(src_schema.cur_default_value_, cur_default_value_))) {
     } else if (OB_FAIL(deep_copy_str(src_schema.column_name_, column_name_))) {
     } else if (OB_FAIL(deep_copy_str(src_schema.comment_, comment_))) {
+    } else if (OB_FAIL(set_ai_expr(src_schema.ai_expr_))) {
+    } else if (OB_FAIL(set_ai_normalized_expr(src_schema.ai_normalized_expr_))) {
+    } else if (OB_FAIL(deep_copy_str(src_schema.ai_dependencies_, ai_dependencies_))) {
     } else if (OB_FAIL(set_extended_type_info(src_schema.extended_type_info_))) {
     } else if (src_schema.column_ref_idxs_ != NULL) {
       if (OB_FAIL(alloc_column_ref_set())) {
@@ -116,6 +126,9 @@ int64_t ObColumnSchemaV2::get_convert_size() const
 {
   int64_t convert_size = sizeof(*this);
 
+  convert_size += ai_expr_.length() + 1;
+  convert_size += ai_normalized_expr_.length() + 1;
+  convert_size += ai_dependencies_.length() + 1;
   convert_size += orig_default_value_.get_deep_copy_size();
   convert_size += cur_default_value_.get_deep_copy_size();
   convert_size += column_name_.length() + 1;
@@ -187,6 +200,15 @@ void ObColumnSchemaV2::reset()
   reset_string_array(extended_type_info_);
   skip_index_attr_.reset();
   lob_chunk_size_ = OB_DEFAULT_LOB_CHUNK_SIZE;
+  ai_expr_.reset();
+  ai_normalized_expr_.reset();
+  ai_dependencies_.reset();
+  ai_max_retries_ = 2;
+  ai_definition_version_ = 0;
+  ai_state_column_id_ = 0;
+  ai_request_column_id_ = 0;
+  ai_result_spec_column_id_ = 0;
+
   local_session_vars_.reset();
   ObSchema::reset();
 }
@@ -235,7 +257,15 @@ OB_DEF_SERIALIZE(ObColumnSchemaV2)
                 sub_type_,
                 skip_index_attr_,
                 lob_chunk_size_,
-                local_session_vars_);
+                local_session_vars_,
+                ai_expr_,
+                ai_normalized_expr_,
+                ai_dependencies_,
+                ai_max_retries_,
+                ai_definition_version_,
+                ai_state_column_id_,
+                ai_request_column_id_,
+                ai_result_spec_column_id_);
   }
 
   return ret;
@@ -297,6 +327,15 @@ OB_DEF_DESERIALIZE(ObColumnSchemaV2)
                 lob_chunk_size_,
                 local_session_vars_);
   }
+  if (OB_SUCC(ret) && pos < data_len) {
+    ObString ai_expr;
+    ObString ai_normalized_expr;
+    ObString ai_dependencies;
+    LST_DO_CODE(OB_UNIS_DECODE, ai_expr, ai_normalized_expr, ai_dependencies, ai_max_retries_, ai_definition_version_, ai_state_column_id_, ai_request_column_id_, ai_result_spec_column_id_);
+    if (OB_SUCC(ret)) { ret = set_ai_expr(ai_expr); }
+    if (OB_SUCC(ret)) { ret = set_ai_normalized_expr(ai_normalized_expr); }
+    if (OB_SUCC(ret)) { ret = deep_copy_str(ai_dependencies, ai_dependencies_); }
+  }
   return ret;
 }
 
@@ -340,7 +379,15 @@ OB_DEF_SERIALIZE_SIZE(ObColumnSchemaV2)
               sub_type_,
               skip_index_attr_,
               lob_chunk_size_,
-              local_session_vars_);
+              local_session_vars_,
+              ai_expr_,
+              ai_normalized_expr_,
+              ai_dependencies_,
+              ai_max_retries_,
+              ai_definition_version_,
+              ai_state_column_id_,
+              ai_request_column_id_,
+              ai_result_spec_column_id_);
   return len;
 }
 
@@ -518,6 +565,42 @@ int ObColumnSchemaV2::add_type_info(const ObString &type_info)
   return add_string_to_array(type_info, extended_type_info_);
 }
 
+int ObColumnSchemaV2::set_ai_dependencies(const ObString &value)
+{
+  int ret = OB_SUCCESS;
+  const bool replace_refs = !ai_dependencies_.empty() || !value.empty();
+  ObSEArray<uint64_t, 8> ids;
+  uint64_t id = 0;
+  bool digit = false;
+  for (int64_t i = 0; OB_SUCC(ret) && i <= value.length() && !value.empty(); ++i) {
+    if (i == value.length() || value[i] == ',') {
+      if (!digit || id < OB_APP_MIN_COLUMN_ID) { ret = OB_INVALID_ARGUMENT; }
+      else { ret = ids.push_back(id); }
+      id = 0;
+      digit = false;
+    } else if (value[i] < '0' || value[i] > '9' || id > (UINT64_MAX - 9) / 10) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      digit = true;
+      id = id * 10 + value[i] - '0';
+    }
+  }
+  if (OB_SUCC(ret)) { ret = deep_copy_str(value, ai_dependencies_); }
+  if (OB_SUCC(ret) && replace_refs) {
+    ObSEArray<uint64_t, 8> previous;
+    if (OB_FAIL(get_cascaded_column_ids(previous))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < previous.count(); ++i) {
+        ret = del_cascaded_column_id(previous.at(i));
+      }
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < ids.count(); ++i) {
+    ret = add_cascaded_column_id(ids.at(i));
+  }
+  return ret;
+}
+
 int ObColumnSchemaV2::convert_column_id(const hash::ObHashMap<uint64_t, uint64_t> &column_id_map)
 {
   int ret = OB_SUCCESS;
@@ -567,6 +650,23 @@ int ObColumnSchemaV2::convert_column_id(const hash::ObHashMap<uint64_t, uint64_t
     } else {
       set_next_column_id(new_column_id);
     }
+  }
+  if (OB_SUCC(ret) && is_ai_column()) {
+    int64_t *hidden_ids[] = {&ai_state_column_id_, &ai_request_column_id_, &ai_result_spec_column_id_};
+    for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+      uint64_t mapped = 0;
+      if (*hidden_ids[i] > 0) {
+        if (OB_FAIL(column_id_map.get_refactored(*hidden_ids[i], mapped))) {
+        } else { *hidden_ids[i] = mapped; }
+      }
+    }
+    ObSEArray<uint64_t, 8> deps;
+    ObSqlString encoded;
+    if (OB_SUCC(ret)) { ret = get_cascaded_column_ids(deps); }
+    for (int64_t i = 0; OB_SUCC(ret) && i < deps.count(); ++i) {
+      ret = encoded.append_fmt("%s%lu", i == 0 ? "" : ",", deps.at(i));
+    }
+    if (OB_SUCC(ret)) { ret = deep_copy_str(encoded.string(), ai_dependencies_); }
   }
   return ret;
 }

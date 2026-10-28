@@ -1,0 +1,6 @@
+Compiling review_client_unity.cxx
+Compiling ob_expr_ai_prompt_test.cpp
+Compiling test_ob_openai_utils.cpp
+AI review test binary built successfully
+Compiling endpoint proxy fix
+Reviewed server binary built successfully

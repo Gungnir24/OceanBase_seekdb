@@ -1966,6 +1966,14 @@ int ObDDLResolver::resolve_column_definition(ObColumnSchemaV2 &column,
       }
     }
   }
+  if (OB_SUCC(ret) && column.is_ai_column()
+      && (resolve_stat.is_set_default_value_ || resolve_stat.is_set_not_null_
+          || resolve_stat.is_primary_key_ || resolve_stat.is_unique_key_
+          || column.is_autoincrement() || column.is_on_update_current_timestamp()
+          || column.is_generated_column())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "default, key or synchronous generation attributes on AI COLUMN");
+  }
   return ret;
 }
 
@@ -2268,6 +2276,10 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
           } else if (OB_FAIL(ObCharset::check_and_fill_info(charset_type, collation_type))) {
           }
         }
+        break;
+      }
+      case T_AI_COLUMN: {
+        ret = resolve_ai_column_attribute(column, *attr_node);
         break;
       }
       case T_COL_SKIP_INDEX: {
@@ -8081,3 +8093,5 @@ int ObDDLResolver::get_partition_keys_by_part_func_expr(
 
 }  // namespace sql
 }  // namespace oceanbase
+
+#include "sql/resolver/ddl/ob_ai_column_resolver.ipp"

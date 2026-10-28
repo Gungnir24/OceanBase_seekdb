@@ -1,0 +1,48 @@
+AI function enhancement review — 2026-10-27
+
+Changes saved locally, not committed or pushed:
+1. src/observer/ai_service/ob_ai_service_proxy.cpp
+   Preserve an empty access key when inserting/updating an endpoint, and read
+   nullable access keys as empty before provider-specific validation. This fixes
+   Ollama completion failing with 4152 after ALTER_AI_MODEL_ENDPOINT.
+2. src/sql/engine/expr/ob_expr_ai/ob_ai_func_client.cpp
+   Clear partial response data before retries, cap each attempt/backoff by the
+   remaining deadline, retain the header list on allocation failure, and have
+   curl own the copied request body.
+3. unittest/sql/engine/expr/
+   Added focused C++ tests, HTTP fault fixture, SQL integration coverage, and
+   a build helper using an existing completed CMake build.
+
+Verified results:
+- The modified client and endpoint proxy compiled; an independent server binary
+  was linked successfully. See build.txt.
+- All 11 focused C++ tests passed. See unit.txt.
+- With the original client, the partial-response retry regression fails with
+  invalid JSON; with the modified client it passes. See baseline.txt and unit.txt.
+- ai_function_enhancement.test passed after the endpoint fix.
+- ai_prompt.test passed. See mysqltest-fixed.txt.
+- Additional SQL regression passed: completion/config/nested prompt, 70000-byte
+  prompt, Ollama provider alteration, embedding dimensions and invalid response,
+  135 rows including NULL, reversed response indexes, filtering/LIMIT, varying
+  per-row dimensions, and 43-document stable rerank with global ID mapping.
+  The 122 non-NULL embeddings were sent in batches of 64 and 58.
+  See integration-fixed.txt.
+
+Validation environment and limits:
+- Tests used an isolated server at port 2888 with a deterministic, self-authored
+  loopback Mock AI service, not the competition platform's private Mock service.
+- Existing mysqltest statements and expected values were retained; only the Mock
+  URL in temporary test/result copies was relocated to the loopback fixture.
+- The original platform DROP_AI_MODEL 10-second timeout was not reproduced.
+  A platform rerun and its database logs are still needed to resolve that issue.
+- These results do not claim that all private competition tests pass.
+
+Reproduction (Linux, from the matching source checkout after a completed build):
+python3 unittest/sql/engine/expr/build_ai_review_tests.py --build-dir build_release --output-dir /tmp/seekdb-ai-review --server
+python3 unittest/sql/engine/expr/run_ai_http_regression.py /tmp/seekdb-ai-review/ai_function_tests
+python3 unittest/sql/engine/expr/test_ai_function_integration.py --port PORT_OF_DISPOSABLE_REVIEWED_SERVER
+
+The standalone build helper's Python syntax was checked locally. The recorded
+server build used the equivalent workspace-specific helper, replacing includes
+with the reviewed files in copied Unity sources, without overwriting shared
+production libraries or other running database instances.

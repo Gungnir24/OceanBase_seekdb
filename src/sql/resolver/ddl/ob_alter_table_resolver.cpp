@@ -3453,10 +3453,26 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
           }
         }
 
+        ObSEArray<ObColumnSchemaV2, 3> ai_hidden;
+        if (OB_SUCC(ret) && alter_column_schema.is_ai_column()) {
+          uint64_t max_id = table_schema_->get_max_used_column_id()
+                         + alter_table_stmt->get_alter_table_schema().get_column_count() + 1;
+          alter_column_schema.set_column_id(max_id);
+          if (OB_FAIL(resolve_ai_column_definition(alter_column_schema, *table_schema_))) {
+          } else if (OB_FAIL(make_ai_hidden_columns(alter_column_schema, max_id, ai_hidden))) {
+          }
+        }
         //add column
         if (OB_SUCC(ret)) {
           if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
+          }
+          for (int64_t j = 0; OB_SUCC(ret) && j < ai_hidden.count(); ++j) {
+            AlterColumnSchema hidden;
+            hidden.alter_type_ = OB_DDL_ADD_COLUMN;
+            if (OB_FAIL(hidden.ObColumnSchemaV2::assign(ai_hidden.at(j)))) {
+            } else if (OB_FAIL(alter_table_stmt->add_column(hidden))) {
+            }
           }
         }
       }
@@ -3831,6 +3847,23 @@ int ObAlterTableResolver::check_alter_part_key_allowed(const ObTableSchema &tabl
   return ret;
 }
 
+// A definition or dependency rewrite needs a new generation and atomic
+// invalidation. Reject unsupported rewrites instead of silently losing metadata.
+static int check_ai_column_rewrite(const ObTableSchema &table, const ObColumnSchemaV2 &column)
+{
+  int ret = OB_SUCCESS;
+  bool protected_column = column.is_ai_column();
+  for (auto it = table.column_begin(); !protected_column && it != table.column_end(); ++it) {
+    protected_column = *it != nullptr && (*it)->is_ai_column()
+        && (*it)->has_cascaded_column_id(column.get_column_id());
+  }
+  if (protected_column) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "modifying an AI column or its dependency");
+  }
+  return ret;
+}
+
 int ObAlterTableResolver::resolve_change_column(const ParseNode &node)
 {
   int ret = OB_SUCCESS;
@@ -3863,6 +3896,7 @@ int ObAlterTableResolver::resolve_change_column(const ParseNode &node)
                        table_schema_->get_table_name_str().ptr());
       }
     }
+    if (OB_SUCC(ret)) { ret = check_ai_column_rewrite(*table_schema_, *origin_col_schema); }
     //resolve new column definition
     if (OB_SUCC(ret)) {
       ObColumnResolveStat stat;
@@ -3880,6 +3914,9 @@ int ObAlterTableResolver::resolve_change_column(const ParseNode &node)
       ObSEArray<ObColumnSchemaV2 *, 8> resolved_cols;
       if (OB_FAIL(get_table_schema_all_column_schema(resolved_cols, alter_table_stmt->get_alter_table_schema()))) {
       } else if (OB_FAIL(resolve_alter_table_column_definition(alter_column_schema, node.children_[1], stat, is_modify_column_visibility, resolved_cols))) {
+      } else if (alter_column_schema.is_ai_column()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "converting an existing column to an AI column");
       } else if (!stat.is_primary_key_ && OB_FAIL(resolve_alter_column_not_null(alter_column_schema, *origin_col_schema))) {
       } else {
         //TODO(xiyu):hanlde change column c2 c3 int unique key; support unique key
@@ -4030,6 +4067,7 @@ int ObAlterTableResolver::resolve_modify_column(const ParseNode &node,
                            table_schema_->get_table_name_str().ptr());
           }
         } else {
+          ret = check_ai_column_rewrite(*table_schema_, *origin_col_schema);
           //alter column's generated column flag should be parsed by itself,
           // So need to clear the generated column flag that was previously copied
           alter_column_schema.set_column_flags(origin_col_schema->get_column_flags());
@@ -4053,6 +4091,9 @@ int ObAlterTableResolver::resolve_modify_column(const ParseNode &node,
                     resolved_cols,
                     false,
                     allow_has_default))) {
+        } else if (alter_column_schema.is_ai_column()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "converting an existing column to an AI column");
         } else if (!stat.is_primary_key_ &&
                    OB_FAIL(resolve_alter_column_not_null(alter_column_schema, *origin_col_schema))) {
         }
@@ -4214,6 +4255,18 @@ int ObAlterTableResolver::resolve_drop_column(
             algorithm = ObAlterTableArg::AlterAlgorithm::INPLACE;
           }
           alter_table_stmt->get_alter_table_arg().alter_algorithm_ = algorithm;
+        }
+      }
+      if (OB_SUCC(ret)) {
+        const auto *dropped = table_schema_->get_column_schema(alter_column_schema.get_origin_column_name());
+        if (dropped != nullptr) {
+          for (auto it = table_schema_->column_begin(); OB_SUCC(ret) && it != table_schema_->column_end(); ++it) {
+            if (*it != nullptr && (*it)->is_ai_column()
+                && (*it)->has_cascaded_column_id(dropped->get_column_id())) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED, "dropping a dependency of an AI column");
+            }
+          }
         }
       }
       if (OB_SUCC(ret)) {

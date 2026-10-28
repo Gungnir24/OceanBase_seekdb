@@ -150,7 +150,8 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_ENGINE)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_OPEN_TABLES)
             && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CREATE_USER)
-            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CHECK_TABLE)) {
+            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_CHECK_TABLE)
+            && OB_UNLIKELY(parse_tree.type_ != T_SHOW_AI_COLUMNS)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     real_id = 1;
@@ -361,6 +362,28 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
             }
           }
         }();
+        break;
+      }
+      case T_SHOW_AI_COLUMNS: {
+        ObString db_name;
+        ObString table_name;
+        uint64_t db_id = OB_INVALID_ID;
+        uint64_t table_id = OB_INVALID_ID;
+        bool is_view = false;
+        ObSqlString sql;
+        show_resv_ctx.stmt_type_ = stmt::T_SHOW_COLUMNS;
+        if (parse_tree.num_child_ != 1 || parse_tree.children_[0] == nullptr) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(resolve_show_from_table(parse_tree.children_[0], nullptr,
+                         database_name.empty(), T_SHOW_COLUMNS, real_id,
+                         db_name, db_id, table_name, table_id, is_view))) {
+        } else if (OB_FAIL(sql.append_fmt(
+             "SELECT column_name AS Column_name, expression AS Expression, "
+             "dependency_column_ids AS Dependencies, sync_mode AS Sync_mode, "
+             "max_retries AS Max_retries, definition_version AS Definition_version "
+             "FROM oceanbase.__all_ai_column WHERE table_id=%lu ORDER BY column_id", table_id))) {
+        } else if (OB_FAIL(ob_write_string(*allocator_, sql.string(), select_sql))) {
+        }
         break;
       }
       case T_SHOW_COLUMNS: {

@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include "sql/engine/basic/file_sql_bridge.h"
 #include "config_bridge.h"
 #include "ob_dml_resolver.h"
 #include "sql/resolver/dml/ob_view_table_resolver.h"
@@ -1863,6 +1864,7 @@ int ObDMLResolver::resolve_basic_column_item(const TableItem &table_item,
     const ObColumnSchemaV2 *col_schema = NULL;
     const ObTableSchema *table_schema = NULL;
     uint64_t tid = table_item.ref_id_;
+    if (!session_info_->is_user_session() || params_.query_ctx_->ai_retry_column_id_ != 0) { include_hidden = true; }
     if (!include_hidden) {
       if (!ObCharset::case_insensitive_equal(column_name, OB_HIDDEN_PK_INCREMENT_COLUMN_NAME)) {
         //do nothing
@@ -3940,7 +3942,11 @@ int ObDMLResolver::resolve_function_table_item(const ParseNode &parse_tree,
   }
   if (OB_SUCC(ret)) {
     OX (params_.is_resolve_table_function_expr_ = true);
-    OZ (resolve_sql_expr(*(parse_tree.children_[0]), function_table_expr));
+    if (file_sql::call(parse_tree.children_[0])) {
+      OZ (file_sql::bind(*parse_tree.children_[0], params_, function_table_expr));
+    } else {
+      OZ (resolve_sql_expr(*(parse_tree.children_[0]), function_table_expr));
+    }
     OX (params_.is_resolve_table_function_expr_ = false);
     CK (OB_NOT_NULL(function_table_expr));
     OX (alias_node = parse_tree.children_[1]);
@@ -5662,6 +5668,32 @@ int ObDMLResolver::resolve_partitions(const ParseNode *part_node,
         if (OB_FAIL(table_item.part_ids_.assign(part_ids))) {
         } else if (OB_FAIL(table_item.part_names_.assign(part_names))) {
         }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDMLResolver::check_ai_column_write(const ObColumnRefRawExpr *column, ObDMLStmt *stmt)
+{
+  int ret = OB_SUCCESS;
+  if (column == nullptr || stmt == nullptr || session_info_ == nullptr) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (session_info_->is_user_session()) {
+    const TableItem *table = stmt->get_table_item_by_id(column->get_table_id());
+    const ColumnItem *item = stmt->get_column_item_by_id(column->get_table_id(), column->get_column_id());
+    const ObTableSchema *schema = nullptr;
+    if (table == nullptr) { ret = OB_ERR_UNEXPECTED; }
+    else if (OB_FAIL(schema_checker_->get_table_schema(table->get_base_table_item().ref_id_, schema))) {
+    } else if (schema != nullptr) {
+      const uint64_t id = table->is_basic_table() ? column->get_column_id()
+                         : (item == nullptr ? OB_INVALID_ID : item->base_cid_);
+      const auto *col = schema->get_column_schema(id);
+      if (col != nullptr && col->is_ai_column()
+          && !(params_.query_ctx_->ai_retry_table_id_ == schema->get_table_id()
+               && params_.query_ctx_->ai_retry_column_id_ == id)) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "direct assignment to AI COLUMN");
       }
     }
   }
@@ -7631,6 +7663,26 @@ int ObDMLResolver::resolve_function_table_column_item_sys_func(const TableItem &
   CK (OB_LIKELY(table_item.is_function_table()));
   CK (OB_NOT_NULL(table_expr = table_item.function_table_expr_));
   OZ (table_expr->deduce_type(session_info_));
+  if (OB_SUCC(ret) && file_sql::expression(table_expr)) {
+    file_sql::Schema schema;
+    if (!file_sql::schema_from_expr(table_expr, schema)) return OB_ERR_UNEXPECTED;
+    for (size_t i = 0; OB_SUCC(ret) && i < schema.columns.size(); ++i) {
+      const auto &c = schema.columns[i];
+      ObString name;
+      OZ (ob_write_string(*allocator_, file_sql::ob_string(c.name), name));
+      col_item = stmt->get_column_item(table_item.table_id_, name);
+      if (OB_SUCC(ret) && NULL == col_item) {
+        ObObjMeta meta; meta.set_type(file_sql::object_type(c.type));
+        if (meta.is_string_type()) { meta.set_collation_type(CS_TYPE_UTF8MB4_BIN); meta.set_collation_level(CS_LEVEL_IMPLICIT); }
+        ObAccuracy accuracy = ObAccuracy::DDL_DEFAULT_ACCURACY[meta.get_type()];
+        if (meta.is_string_type()) accuracy.set_length(file_sql::MAX_RECORD);
+        if (c.type == file_sql::Type::DateTime) accuracy.set_scale(c.scale);
+        OZ (resolve_function_table_column_item(table_item, meta, accuracy, name, OB_APP_MIN_COLUMN_ID + i, col_item));
+      }
+      if (OB_SUCC(ret)) { OZ (col_items.push_back(*col_item)); }
+    }
+    return ret;
+  }
   if (OB_FAIL(ret)) { // do nothing ...
   } else if (!ObResolverUtils::is_expr_can_be_used_in_table_function(*table_expr)) {
     ret = OB_NOT_SUPPORTED;

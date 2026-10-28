@@ -3218,6 +3218,15 @@ int ObTableSqlService::gen_column_dml_without_check(
                          || (OB_FAIL(dml.add_column("skip_index_attr", column.get_skip_index_attr().get_packed_value())))
                          || (OB_FAIL(dml.add_column("lob_chunk_size", column.get_lob_chunk_size())))
                          || (OB_FAIL(dml.add_column("local_session_vars", ObHexEscapeSqlStr(local_session_var))))
+                         || OB_FAIL(dml.add_column("ai_expr", ObHexEscapeSqlStr(column.get_ai_expr())))
+                         || OB_FAIL(dml.add_column("ai_normalized_expr", ObHexEscapeSqlStr(column.get_ai_normalized_expr())))
+                         || OB_FAIL(dml.add_column("ai_dependencies", ObHexEscapeSqlStr(column.get_ai_dependencies())))
+                         || OB_FAIL(dml.add_column("ai_max_retries", column.get_ai_max_retries()))
+                         || OB_FAIL(dml.add_column("ai_definition_version", column.get_ai_definition_version()))
+                         || OB_FAIL(dml.add_column("ai_state_column_id", column.get_ai_state_column_id()))
+                         || OB_FAIL(dml.add_column("ai_request_column_id", column.get_ai_request_column_id()))
+                         || OB_FAIL(dml.add_column("ai_result_spec_column_id", column.get_ai_result_spec_column_id()))
+
                          || OB_FAIL(dml.add_gmt_create())
                          || OB_FAIL(dml.add_gmt_modified()))) {
     }

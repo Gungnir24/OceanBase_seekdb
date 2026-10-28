@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "sql/engine/ai_column_strict.h"
+
 #define USING_LOG_PREFIX SQL
 #include "config_bridge.h"
 #include "sql/ob_sql.h"
@@ -2404,7 +2406,9 @@ int ObSql::generate_plan(ParseResult &parse_result,
       }
     }
 
+    phy_plan->is_ai_column_retry_ = stmt->get_query_ctx()->ai_retry_column_id_ != 0;
     if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ai_column_strict::capture(*stmt, *sql_ctx.schema_guard_, phy_plan->ai_column_refs_))) {
     } else if (OB_FAIL(transform_stmt(&stmt->get_query_ctx()->sql_schema_guard_,
                                       opt_stat_mgr_,
                                       &self_addr_,
@@ -3528,7 +3532,8 @@ int ObSql::need_add_plan(const ObPlanCacheCtx &pc_ctx,
   } else if (OB_ISNULL(result.get_exec_context().get_stmt_factory())
              || OB_ISNULL(result.get_exec_context().get_stmt_factory()->get_query_ctx())) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (result.get_exec_context().get_stmt_factory()->get_query_ctx()->has_hybrid_search()) {
+  } else if (result.get_exec_context().get_stmt_factory()->get_query_ctx()->has_file_sql_
+             || result.get_exec_context().get_stmt_factory()->get_query_ctx()->has_hybrid_search()) {
     need_add_plan = false;
   }
   return ret;

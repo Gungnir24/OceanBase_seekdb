@@ -7455,6 +7455,15 @@ int ObDDLService::fill_new_column_attributes(
     new_column_schema.set_srs_id(alter_column_schema.get_srs_id());
     new_column_schema.set_skip_index_attr(alter_column_schema.get_skip_index_attr().get_packed_value());
     new_column_schema.set_lob_chunk_size(alter_column_schema.get_lob_chunk_size());
+    if (OB_SUCC(ret)) { ret = new_column_schema.set_ai_expr(alter_column_schema.get_ai_expr()); }
+    if (OB_SUCC(ret)) { ret = new_column_schema.set_ai_normalized_expr(alter_column_schema.get_ai_normalized_expr()); }
+    if (OB_SUCC(ret)) { ret = new_column_schema.set_ai_dependencies(alter_column_schema.get_ai_dependencies()); }
+    new_column_schema.set_ai_max_retries(alter_column_schema.get_ai_max_retries());
+    new_column_schema.set_ai_definition_version(alter_column_schema.get_ai_definition_version());
+    new_column_schema.set_ai_state_column_id(alter_column_schema.get_ai_state_column_id());
+    new_column_schema.set_ai_request_column_id(alter_column_schema.get_ai_request_column_id());
+    new_column_schema.set_ai_result_spec_column_id(alter_column_schema.get_ai_result_spec_column_id());
+
     if (OB_FAIL(new_column_schema.get_local_session_var().deep_copy(alter_column_schema.get_local_session_var()))) {
     }
   }

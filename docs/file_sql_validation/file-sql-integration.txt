@@ -1,0 +1,16 @@
+PASS default disabled and ordinary SQL
+PASS CSV values, aliases, filters, aggregates, HAVING
+PASS named options and JSON union schema
+PASS DESCRIBE dynamic columns
+PASS Parquet and projected columns
+PASS native INNER/LEFT and cross-format JOIN
+PASS glob discovery
+PASS COPY roundtrip, target collision and rollback
+PASS COPY regular table and custom CSV options
+PASS schema refresh and all-NULL columns
+PASS paths, malformed data and feature switch
+PASS Parquet V1/V2, nullable columns, dates and multiple pages
+PASS numeric boundaries, invalid dates and UTF-8 headers
+PASS glob directory wildcards
+PASS forced nested-loop rescan and file changes during streaming
+15/15 integration groups passed

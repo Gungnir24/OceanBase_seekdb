@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include "sql/engine/basic/file_sql_bridge.h"
 
 #include "config_bridge.h"
 #include "share/config/ob_config_helper.h"
@@ -124,6 +125,16 @@ int ObResolverUtils::get_all_function_table_column_names(const TableItem &table_
   ObRawExpr *table_expr = NULL;
   ObPLPackageGuard *package_guard = nullptr;
   const ObUserDefinedType *user_type = NULL;
+  if (file_sql::expression(table_item.function_table_expr_)) {
+    file_sql::Schema schema;
+    if (!file_sql::schema_from_expr(table_item.function_table_expr_, schema)) return OB_ERR_UNEXPECTED;
+    for (const auto &c : schema.columns) {
+      ObString name;
+      OZ (ob_write_string(*params.allocator_, file_sql::ob_string(c.name), name));
+      OZ (column_names.push_back(name));
+    }
+    return ret;
+  }
   ObExecContext *exec_ctx = params.session_info_->get_cur_exec_ctx();
   CK (OB_NOT_NULL(exec_ctx));
   OZ (exec_ctx->get_package_guard(package_guard));
@@ -1726,6 +1737,7 @@ stmt::StmtType ObResolverUtils::get_stmt_type_by_item_type(const ObItemType item
       SET_STMT_TYPE(T_DIAGNOSTICS);
       // read only
       SET_STMT_TYPE(T_EXPLAIN);
+      case T_SHOW_AI_COLUMNS: type = stmt::T_SHOW_COLUMNS; break;
       SET_STMT_TYPE(T_SHOW_COLUMNS);
       SET_STMT_TYPE(T_SHOW_TABLES);
       SET_STMT_TYPE(T_SHOW_DATABASES);

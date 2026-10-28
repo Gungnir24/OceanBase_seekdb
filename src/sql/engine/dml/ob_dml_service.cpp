@@ -632,6 +632,7 @@ int ObDMLService::process_insert_row(const ObInsCtDef &ins_ctdef,
     }
 
   }
+  if (OB_SUCC(ret) && !is_skipped) { ret = process_ai_columns(ins_ctdef, dml_op); }
   return ret;
 }
 
@@ -734,6 +735,7 @@ int ObDMLService::process_delete_row(const ObDelCtDef &del_ctdef,
                "old_row", ROWEXPR2STR(dml_op.get_eval_ctx(), del_ctdef.old_row_));
   }
 
+  if (OB_SUCC(ret) && !is_skipped) { ret = process_ai_columns(del_ctdef, dml_op); }
   return ret;
 }
 
@@ -832,6 +834,7 @@ int ObDMLService::process_update_row(const ObUpdCtDef &upd_ctdef,
                 "old_row", ROWEXPR2STR(dml_op.get_eval_ctx(), upd_ctdef.old_row_),
                 "new_row", ROWEXPR2STR(dml_op.get_eval_ctx(), upd_ctdef.new_row_));
   }
+  if (OB_SUCC(ret) && !is_skipped) { ret = process_ai_columns(upd_ctdef, dml_op); }
   return ret;
 }
 
@@ -2384,3 +2387,5 @@ int ObDMLService::get_root_exec_ctx_for_fk_cascading(ObExecContext *ctx, ObExecC
 
 }  // namespace sql
 }  // namespace oceanbase
+
+#include "sql/engine/dml/ob_ai_column_dml.ipp"
