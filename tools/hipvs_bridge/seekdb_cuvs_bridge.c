@@ -40,12 +40,13 @@ static double sk_now_ms(void)
 
 /* One cuVS runtime (stream + workspace) for the whole process. */
 static pthread_once_t g_res_once = PTHREAD_ONCE_INIT;
-static cuvsResources_t g_res = NULL;
+/* cuvsResources_t is an opaque unsigned long on hipVS and a pointer on CUDA;\n * 0 is the portable null value for both. */
+static cuvsResources_t g_res = 0;
 
 static void sk_create_shared_resources(void)
 {
   if (cuvsResourcesCreate(&g_res) != CUVS_SUCCESS) {
-    g_res = NULL;
+    g_res = 0;
   }
 }
 
@@ -114,7 +115,7 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   sk_cuvs_index* h = (sk_cuvs_index*)calloc(1, sizeof(*h));
   if (!h) return NULL;
   h->res = sk_resources();
-  if (h->res == NULL) { free(h); return NULL; }
+  if (h->res == 0) { free(h); return NULL; }
 
   DLManagedTensor dset; long ds[2] = {n, dim};
   dset.dl_tensor.data = (void*)base;
