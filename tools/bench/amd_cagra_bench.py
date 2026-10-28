@@ -39,11 +39,13 @@ import sys
 import time
 
 OBSERVER_PARAMS = [
-    "--parameter", "__min_full_resource_pool_memory=2147483648",
-    "--parameter", "memory_budget=2G",
+    # Mirrors the parameters shipped with the demo image, which are known to
+    # bootstrap on the contest container.
+    "--parameter", "_memory_budget=16G",
     "--parameter", "datafile_size=20G",
-    "--parameter", "cpu_count=16",
-    "--parameter", "local_ip=127.0.0.1",
+    "--parameter", "datafile_maxsize=40G",
+    "--parameter", "log_disk_size=10G",
+    "--log-level", "INFO",
 ]
 
 
@@ -122,7 +124,6 @@ class Observer:
         self.proc = subprocess.Popen(
             [
                 self.args.observer, "--nodaemon", "--port", str(self.args.port),
-                "--data-dir", str(self.run_dir / "store"),
                 "--base-dir", str(self.run_dir),
                 *OBSERVER_PARAMS,
             ],
