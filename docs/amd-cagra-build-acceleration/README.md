@@ -161,3 +161,36 @@ tools/bench/run_all.sh \
 
 也就是说：**只看 CPU 路径，这份基线没有多少可挤的水分**；14 分的构建加速
 必须走 GPU，而 GPU 路径现在卡在 2.1 的第 3 步（缓冲被 DDL 的 delete_index 清掉）。
+### 2.3 B 阶段：GPU 通路打通，但正确性卡在 vid 映射
+
+接着把"DDL 结束时缓冲被一起删掉"这个问题修掉了：`delete_index` 不再直接丢弃
+缓冲，而是挂到孤儿池；索引从序列化数据重载后，第一次查询按"维度 + 行数"校验
+认领（`SEEKDB_CUVS_ADOPT=1`）。修复后探针实测：
+
+`
+[OBVSAG][cuVS] adopted the build-phase buffer after reload
+cuvs_build  handle=... a=128 b=20000
+cuvs_serve  handle=... a=10  b=20000
+`
+
+GPU 第一次真正建图并接管查询。单独验证桥接 .so 也是对的（给定随机 1000x16、
+用第 137 行做查询，返回 offset=137、距离 0.000000，与暴力最近邻一致）。
+
+在此基础上加了"GPU 独占建索引"开关（`SEEKDB_CUVS_GPU_ONLY=1`，标记为 cuvs 的
+索引跳过逐行 VSAG 插入，只喂 GPU）：
+
+| 20k 构建 | 耗时 | 召回@10 |
+|---|---|---|
+| 基线 | 8.633 s | 0.824 |
+| GPU 独占（ddl 0.77 s + 首次查询 1.78 s） | **2.545 s（3.4x）** | **0.0** |
+
+构建确实快了 3.4 倍，但召回掉到 0。原因不是 CAGRA 算错，而是**快照索引里还存着
+vid ↔ 主键 的映射**（这正是 DDL 每行都带的那个 extra-info 列）：跳过 VSAG 逐行
+插入，映射也就没了，返回的行 id 全对不上。
+
+所以两个开关默认都关（`SEEKDB_CUVS_ADOPT`/`SEEKDB_CUVS_GPU_ONLY` 不设即为关），
+默认路径保持"CPU 建索引 + 结果正确"，只保留已验证无害的批量追加。
+
+要同时拿到"快 + 对"，只剩一条路：用 VSAG 的批量 Build（并行建图）一次性写入
+图和 extra-info。这条路径已经接好（`SEEKDB_BULK_BUILD=1`），但带 extra-info
+时 VSAG 会段错误，需要单独定位。

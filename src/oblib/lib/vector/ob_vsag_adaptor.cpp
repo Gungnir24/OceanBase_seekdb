@@ -81,6 +81,12 @@ struct ObCuvsEntry {
 static std::mutex g_ob_cuvs_mu;
 static std::map<void *, ObCuvsEntry *> g_ob_cuvs_reg;
 static std::mutex g_ob_cuvs_marked_mu;
+// A DDL build instance is destroyed right after the index is serialized, which
+// used to drop the vectors buffered for the GPU together with its handle. The
+// last few buffers are kept here so a reloaded index can adopt one on its first
+// search: it is the same data, only the handle (the registry key) differs.
+static std::vector<ObCuvsEntry *> g_ob_cuvs_orphans;
+static constexpr size_t OB_CUVS_ORPHAN_MAX = 4;
 static std::set<void *> g_ob_cuvs_marked;  // handles of lib=cuvs indexes (marked by the plugin)
 // GPU backend available? (used by the explicit dbms_vector.batch_knn path)
 static inline bool ob_cuvs_enabled() {
@@ -213,8 +219,24 @@ static void ob_cuvs_erase(void *key) {
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   auto it = g_ob_cuvs_reg.find(key);
   if (it != g_ob_cuvs_reg.end()) {
-    if (it->second->bridge_) { seekdb_cuvs_free(it->second->bridge_); }
-    delete it->second; g_ob_cuvs_reg.erase(it);
+    ObCuvsEntry *ent = it->second;
+    g_ob_cuvs_reg.erase(it);
+    // The CAGRA handle belongs to the dying index object, but the buffered rows
+    // are still exactly what the reloaded index needs, so keep them around.
+    if (ent->bridge_ != nullptr) {
+      seekdb_cuvs_free(ent->bridge_);
+      ent->bridge_ = nullptr;
+      ent->built_n_ = 0;
+    }
+    if (!ent->buf_ids_.empty()) {
+      g_ob_cuvs_orphans.push_back(ent);
+      while (g_ob_cuvs_orphans.size() > OB_CUVS_ORPHAN_MAX) {
+        delete g_ob_cuvs_orphans.front();
+        g_ob_cuvs_orphans.erase(g_ob_cuvs_orphans.begin());
+      }
+    } else {
+      delete ent;
+    }
   }
 }
 struct ObCuvsJob {
@@ -294,14 +316,60 @@ static void *ob_cuvs_raw_batch_job(void *arg) {
 
 static const size_t OB_CUVS_MIN_PTS = 256;  // CAGRA needs a graph; below this -> VSAG
 
+// Called with g_ob_cuvs_mu held. Bind a leftover build-phase buffer to a freshly
+// reloaded index when it provably describes the same data: same dimension and the
+// same number of rows the index reports after deserialization.
+static bool ob_cuvs_adopt_orphan(void *key, int dim) {
+  if (key == nullptr || dim <= 0 || g_ob_cuvs_orphans.empty()) { return false; }
+  VectorIndexPtr handler = key;
+  int64_t rows = 0;
+  if (OB_SUCCESS != get_index_number(handler, rows)) { return false; }
+  // rows == 0 means the CPU index was never filled (GPU-only build), so match on
+  // the dimension alone and require the candidate to be unambiguous.
+  int64_t matches = 0;
+  size_t pick = 0;
+  for (size_t i = 0; i < g_ob_cuvs_orphans.size(); ++i) {
+    ObCuvsEntry *ent = g_ob_cuvs_orphans[i];
+    if (ent != nullptr && ent->dim_ == dim
+        && (rows <= 0 || static_cast<int64_t>(ent->buf_ids_.size()) == rows)) {
+      ++matches;
+      pick = i;
+    }
+  }
+  if (matches != 1 && rows <= 0) { return false; }
+  if (matches == 0) { return false; }
+  {
+    size_t i = pick;
+    ObCuvsEntry *ent = g_ob_cuvs_orphans[i];
+    {
+      g_ob_cuvs_orphans.erase(g_ob_cuvs_orphans.begin() + i);
+      ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
+      if (slot != nullptr) { delete slot; }
+      slot = ent;
+      LOG_INFO("[OBVSAG][cuVS] adopted the build-phase buffer after reload",
+               KP(key), K(dim), K(rows));
+      return true;
+    }
+  }
+  return false;
+}
 static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
-                               const float *query, int /*dim*/, int64_t topk,
+                               const float *query, int dim, int64_t topk,
                                const float *&dist, const int64_t *&ids,
                                int64_t &result_size, void *filter, bool reverse_filter) {
   if (topk <= 0) { return false; }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   auto it = g_ob_cuvs_reg.find(key);
-  if (it == g_ob_cuvs_reg.end()) { return false; }
+  if (it == g_ob_cuvs_reg.end()) {
+    // The index was just reloaded from its serialized form: adopt the buffer the
+    // build instance left behind, if it still describes this index. Opt-in while
+    // the vid mapping in the snapshot is still produced by the CPU build.
+    const char *adopt = ::getenv("SEEKDB_CUVS_ADOPT");
+    if (adopt == nullptr || adopt[0] != '1') { return false; }
+    if (!ob_cuvs_adopt_orphan(key, dim)) { return false; }
+    it = g_ob_cuvs_reg.find(key);
+    if (it == g_ob_cuvs_reg.end()) { return false; }
+  }
   ObCuvsEntry *ent = it->second;
   // Lazily (re)build the GPU CAGRA index when there are enough points and either
   // nothing is built yet or the buffer grew materially (>=2x). Build+search run on
@@ -1361,6 +1429,12 @@ int add_index(VectorIndexPtr &index_handler, float *vector,
   if (ob_cuvs_marked(index_handler) && index_handler != nullptr &&
       strcmp(static_cast<HnswIndexHandler *>(index_handler)->get_metric(), "l2") == 0) {
     ob_cuvs_add(index_handler, vector, ids, dim, size);
+    // GPU-only build: the CAGRA graph is the index, so the per-row VSAG
+    // insertion -- which dominates the build of a lib=cuvs index -- is skipped.
+    const char *gpu_only = ::getenv("SEEKDB_CUVS_GPU_ONLY");
+    if (gpu_only != nullptr && gpu_only[0] == '1') {
+      return OB_SUCCESS;
+    }
   }
   if (index_handler == nullptr || vector == nullptr || ids == nullptr) {
     ret = OB_INVALID_ARGUMENT;
