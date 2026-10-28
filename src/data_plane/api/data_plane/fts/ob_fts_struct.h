@@ -51,7 +51,12 @@ private:
   ObObjMeta meta_;
 };
 
-typedef common::hash::ObHashMap<ObFTWord, int64_t> ObFTWordMap;
+// Word -> count maps are always owned by a single thread (each tokenize call and
+// each row of a fulltext index build creates its own), yet the default
+// LatchReadWriteDefendMode takes a read/write latch on every lookup, insert and
+// clear. Use the single-threaded defend mode instead: same hash table, same
+// iteration order, no latch traffic.
+typedef common::hash::ObHashMap<ObFTWord, int64_t, common::hash::NoPthreadDefendMode> ObFTWordMap;
 
 class ObAddWordFlag final
 {
