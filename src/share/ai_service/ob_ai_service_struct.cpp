@@ -92,6 +92,7 @@ int ObAiModelEndpointInfo::deep_copy(
   } else if (OB_FAIL(ob_write_string(allocator, other.request_transform_fn_, request_transform_fn_))) {
   } else if (OB_FAIL(ob_write_string(allocator, other.response_transform_fn_, response_transform_fn_))) {
   }
+  max_concurrency_ = other.max_concurrency_;
   return ret;
 }
 
@@ -132,6 +133,10 @@ int ObAiModelEndpointInfo::check_valid() const
   } else if (!response_transform_fn_.empty()) {
     ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("response_transform_fn"), "response_transform_fn");
+  } else if (max_concurrency_ < MIN_MAX_CONCURRENCY || max_concurrency_ > MAX_MAX_CONCURRENCY) {
+    ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+    LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("max_concurrency"), "max_concurrency");
+    LOG_WARN("max_concurrency is out of range", K(ret), K_(max_concurrency));
   }
   return ret;
 }
@@ -166,6 +171,18 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
       EXTRACT_JSON_ELEM_STR("parameters", parameters_)
       EXTRACT_JSON_ELEM_STR("request_transform_fn", request_transform_fn_)
       EXTRACT_JSON_ELEM_STR("response_transform_fn", response_transform_fn_)
+      if (elem.first.case_compare("max_concurrency") == 0) {
+        const ObJsonNodeType type = elem.second->json_type();
+        if (ObJsonNodeType::J_INT != type && ObJsonNodeType::J_UINT != type
+            && ObJsonNodeType::J_DOUBLE != type && ObJsonNodeType::J_DECIMAL != type
+            && ObJsonNodeType::J_OFLOAT != type && ObJsonNodeType::J_ODOUBLE != type) {
+          ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+          LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr());
+          LOG_WARN("max_concurrency must be an integer", K(ret), K(elem.first));
+        } else {
+          max_concurrency_ = elem.second->get_int();
+        }
+      } else
       EXTRACT_JSON_ELEM_END()
     }
     iter.next();

@@ -53,7 +53,9 @@ public:
     bool &has_priv);
 
 private:
-  enum ObAIServiceEndpointPrivType {
+  // The AI model privilege bits live above bit 40, so the enum must use a 64 bit
+  // underlying type instead of the default int.
+  enum ObAIServiceEndpointPrivType : ObPrivSet {
     AI_PRIV_CREATE = OB_PRIV_CREATE_AI_MODEL,
     AI_PRIV_ALTER  = OB_PRIV_ALTER_AI_MODEL,
     AI_PRIV_DROP   = OB_PRIV_DROP_AI_MODEL,

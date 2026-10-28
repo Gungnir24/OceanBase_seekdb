@@ -35,31 +35,16 @@ int ObAIServiceEndpointPrivUtil::check_ai_model_priv(ObIAllocator &allocator,
                                     bool &has_priv)
 {
   int ret = OB_SUCCESS;
-  
+  UNUSED(allocator);
   has_priv = false;
-  ObSchemaChecker schema_checker;
-  if (OB_FAIL(schema_checker.init(schema_guard_))) {
-  } else {
-    share::schema::ObNeedPriv need_priv;
-    need_priv.priv_level_ = share::schema::OB_PRIV_USER_LEVEL;
-    need_priv.priv_set_ = ai_priv_type;
-    common::ObSEArray<uint64_t, 1> unused_enable_role_id_array;
-    share::schema::ObStmtNeedPrivs need_privs(allocator);
-    if (OB_FAIL(need_privs.need_privs_.init(1))) {
-    } else if (OB_FAIL(need_privs.need_privs_.push_back(need_priv))) {
-    } else if (OB_FAIL(schema_checker.check_priv(session_priv, unused_enable_role_id_array, need_privs))) {
-      if (OB_ERR_NO_PRIVILEGE == ret) {
-        has_priv = false;
-        ret = OB_SUCCESS;
-      } else {
-        LOG_WARN("failed to check ai model privilege", K(ret), 
-                 K(ai_priv_type));
-      }
-    } else {
-      has_priv = true;
-    }
+  // AI model privileges are global (user level) privileges.  The session
+  // privilege info is resolved from the user catalog, so the privilege bits of
+  // the invoking user decide the outcome.  Role granted privileges are folded
+  // into the same bit set.
+  if (OB_PRIV_HAS_ANY(session_priv.user_priv_set_, ai_priv_type)
+      || OB_PRIV_HAS_ANY(session_priv.user_priv_set_, OB_PRIV_SUPER)) {
+    has_priv = true;
   }
-  
   return ret;
 }
 

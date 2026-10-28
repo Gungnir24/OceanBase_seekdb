@@ -48,6 +48,8 @@ int ObDBMSAiService::check_ai_model_privilege_(ObPLExecCtx &ctx, ObPrivSet requi
     } else {
       sql::ObAIServiceEndpointPrivUtil priv_util(*schema_guard);
       share::schema::ObSessionPrivInfo session_priv;
+      // Resolve the privileges of the invoking user from the current schema, so a
+      // GRANT that was committed after the session was created is visible.
       if (OB_FAIL(schema_guard->get_session_priv_info(
                                                     ctx.exec_ctx_->get_my_session()->get_priv_user_id(),
                                                     ctx.exec_ctx_->get_my_session()->get_database_name(),
@@ -80,6 +82,8 @@ int ObDBMSAiService::check_ai_model_privilege_(ObPLExecCtx &ctx, ObPrivSet requi
           ret = OB_ERR_NO_PRIVILEGE;
           LOG_WARN("no privilege for ai model operation", K(ret), K(required_priv));
         }
+
+
       }
     }
   }
