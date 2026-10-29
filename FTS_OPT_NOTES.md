@@ -945,3 +945,61 @@ int ObSRDaaTInnerProductRelevanceCollector::get_result(double &relevance, bool &
 
 所以：**逐行分数比的是「同一个索引实例」，跨索引实例只能比 hits 与 token dump。**
 以后做语义校验时，分数的对比必须在同一次索引构建之后、同一个服务进程内完成。
+
+## 21. 第十二轮：`get_word_code` 跨语句缓存 —— 先量化，结论是不值得做
+
+### 21.1 tokenize 指标到底在测什么
+
+`tools/benchmark/fts_large_bench.sh` 的 tokenize 项是**单条语句**重复执行：
+
+```sh
+SELECT tokenize('<IK_TEXT>', 'ik');   # IK_TEXT 共 245 个字符
+```
+
+所以在本地把它拆开量（300 次取平均，同一个 mysql 连接）：
+
+| 语句 | 耗时 |
+| --- | --- |
+| `SELECT 1;` | 180 µs |
+| `SELECT tokenize('', 'ik');` | 195 µs |
+| `SELECT tokenize('<IK_TEXT>', 'ik');` | 495 µs |
+| `SELECT tokenize('<BENG_TEXT>', 'beng');` | 227 µs |
+
+即：**245 字符的 IK 文本，真正花在分词上的约 300 µs，每字符约 1.2 µs**；
+而 BENG 的 114 个 ASCII 字符只要约 32 µs。IK 侧每字符的开销比 ASCII 高一个量级。
+
+### 21.2 字典查找占多少
+
+对这条语句做 15 秒采样（`perf record -gp <worker>`），flat top：
+
+| 占比 | 符号 |
+| --- | --- |
+| 3.02% | `ObFTCacheDict::match_with_hit` |
+| 2.78% | `ObFTDATReader<void>::get_word_code` |
+| 2.58% | `ObFTDATReader<void>::match_with_hit` |
+| 1.51% | `__memcmp_avx2_movbe`（哈希表键比较） |
+| 1.26% | `ObFTRangeDict::find_first_char_range` |
+
+也就是说：**整个字典层（哈希查找 + 双数组 trie 走查 + 区间定位）合计只有约 10%**，
+其中 `get_word_code` 一项约 2.8%。剩下 90% 分散在 SQL 层、`ObFTToken` 链表构造，
+以及把数百个 token 拼成 JSON 结果集上——没有单点超过 3%。
+
+### 21.3 结论：不做
+
+按 2.8% 的占比估算，即使把 `get_word_code` 的哈希查找**完全消除**，
+tokenize_ik 最多提升 4% 左右，折合 33.3 × 0.04 ≈ **1.3 分**（beng 侧还更少，因为 ASCII 根本不走这条路）。
+
+而代价是要维护一个跨语句的全局/线程级缓存，键必须同时包含「词典实例标识」与词面：
+
+- 词典实例地址会在释放后被复用，只用 `dat_` 指针做键会**静默返回错误的 code**（这正是早期
+  char 缓存先段错误、后零收益的原因）；
+- 若只用 `range_id` 做键又不唯一（区间字典按首字符分区，不同类型/排序规则会撞）。
+
+风险与收益完全不成比例。**本轮不改代码**，把这个量化结论沉淀下来，
+避免以后再次在这条路上浪费时间。
+
+### 21.4 顺带确认
+
+`ObIKCJKProcessor::do_process` 里已有的「同一字符的 code 每个字典只解析一次」优化仍然在
+（`code_dict` / `code_valid` 那段），也就是说 `get_word_code` 现在已经是**每字符每字典一次**，
+没有重复调用可省。
