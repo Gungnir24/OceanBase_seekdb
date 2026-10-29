@@ -403,12 +403,33 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ft_word_compare(range_dicts_[i].start_.get_word(), single_word) <= 0
-        && ft_word_compare(range_dicts_[i].end_.get_word(), single_word) >= 0) {
-      dict = range_dicts_[i].dict_;
-      found = true;
+  const int64_t key_len = single_word.length();
+  const bool cacheable = key_len > 0 && key_len <= CHAR_RANGE_MAX_KEY_LEN;
+  uint64_t key = 0;
+  CharRangeEntry *entry = nullptr;
+  if (cacheable) {
+    MEMCPY(&key, single_word.ptr(), key_len);
+    entry = &char_range_cache_[char_range_slot(key, key_len)];
+    if (entry->len_ == key_len && entry->key_ == key) {
+      if (entry->found_) {
+        dict = entry->dict_;
+        found = true;
+      }
+      entry = nullptr; // hit (found or not), nothing left to store
     }
+  }
+  if (nullptr != entry) {
+    for (int i = 0; !found && i < range_dicts_.size(); ++i) {
+      if (ft_word_compare(range_dicts_[i].start_.get_word(), single_word) <= 0
+          && ft_word_compare(range_dicts_[i].end_.get_word(), single_word) >= 0) {
+        dict = range_dicts_[i].dict_;
+        found = true;
+      }
+    }
+    entry->key_ = key;
+    entry->len_ = static_cast<int8_t>(key_len);
+    entry->found_ = found ? 1 : 0;
+    entry->dict_ = found ? dict : nullptr;
   }
   if (!found) {
     // not found, dis match
