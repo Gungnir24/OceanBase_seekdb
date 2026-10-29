@@ -77,6 +77,8 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     merge_cmp_(),
     merge_heap_(nullptr),
     simple_merge_heap_(nullptr),
+    dim_iters_arr_(nullptr),
+    dim_weights_arr_(nullptr),
     relevance_collector_(nullptr),
     iter_domain_ids_(),
     buffered_domain_ids_(),
@@ -124,6 +126,10 @@ int ObSRDaaTIterImpl::init(
     if (OB_UNLIKELY(dim_iters.count() == 0)) {
     } else if (OB_NOT_NULL(iter_param_->dim_weights_) && dim_iters.count() != iter_param_->dim_weights_->count()) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (FALSE_IT(dim_iters_arr_ = &dim_iters.at(0))) {
+    } else if (FALSE_IT(dim_weights_arr_ = OB_NOT_NULL(iter_param_->dim_weights_)
+                                           ? &iter_param_->dim_weights_->at(0)
+                                           : nullptr)) {
     } else if (FALSE_IT(iter_domain_ids_.set_allocator(iter_allocator_))) {
     } else if (OB_FAIL(iter_domain_ids_.init(dim_iters.count()))) {
     } else if (OB_FAIL(iter_domain_ids_.prepare_allocate(dim_iters.count()))) {
@@ -161,6 +167,8 @@ void ObSRDaaTIterImpl::reset()
     merge_heap_ = nullptr;
   }
   simple_merge_heap_ = nullptr;
+  dim_iters_arr_ = nullptr;
+  dim_weights_arr_ = nullptr;
   if (OB_NOT_NULL(relevance_collector_)) {
     relevance_collector_->reset();
     relevance_collector_ = nullptr;
@@ -289,13 +297,10 @@ int ObSRDaaTIterImpl::fill_merge_heap()
 {
   int ret = OB_SUCCESS;
   ObSRMergeItem item;
-  // dim_iters_ is an ObIArray of contiguous pointers; take the raw array once
-  // instead of paying the polymorphic at() per dimension per round.
-  ObISRDaaTDimIter **dim_iters_arr = next_round_cnt_ > 0 ? &dim_iters_->at(0) : nullptr;
-  const double *dim_weights_arr =
-      (nullptr != iter_param_->dim_weights_ && next_round_cnt_ > 0)
-          ? &iter_param_->dim_weights_->at(0)
-          : nullptr;
+  // Both backing arrays are fixed once init() succeeded, so the polymorphic at()
+  // is resolved there instead of once per dimension per round.
+  ObISRDaaTDimIter **dim_iters_arr = dim_iters_arr_;
+  const double *dim_weights_arr = dim_weights_arr_;
   for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
     const int64_t iter_idx = next_round_iter_idxes_[i];
     ObISRDaaTDimIter *dim_iter = nullptr;

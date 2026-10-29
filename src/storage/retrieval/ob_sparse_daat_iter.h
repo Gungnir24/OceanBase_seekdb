@@ -114,6 +114,10 @@ protected:
   // concrete pointer the merger calls (empty / top / pop / push) devirtualize and inline, and
   // they are executed several times per output row.
   ObSRSimpleMerger *simple_merge_heap_;
+  // Raw backing arrays of the dimension iterators and of their weights.  They are resolved once
+  // in init() because they are read once per dimension per output row.
+  ObISRDaaTDimIter **dim_iters_arr_;
+  const double *dim_weights_arr_;
   ObSRDaaTRelevanceCollector *relevance_collector_;
   ObFixedArray<const ObDatum *, ObIAllocator> iter_domain_ids_; // record every dim iter's output domain id, one (ObDatum *) for one dim iter
   ObFixedArray<ObDocIdExt, ObIAllocator> buffered_domain_ids_; // cache for output

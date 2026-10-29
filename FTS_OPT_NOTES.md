@@ -406,3 +406,43 @@ beng 的 FTS 开销里 JSON 打包约占 25%（`pack_json_res` 3.09% + 序列化
 与上一版同一台机器的官方记录（select1 0.1534）相比：cn −5.2%、beng −2.4%、mixed −5.9%，
 limit +9.8%（limit 单次波动大，交错 A/B 里是 −2.1%）。**因本机 select1 本轮反而慢了 5%，
 这些数字只能看方向，不能看绝对值。**
+
+## 12. 第四轮：把每行都取的维度数组指针提到 init()
+
+### 12.1 改动
+
+`ObSRDaaTIterImpl::fill_merge_heap()` 里原来每调用一次（= 每个输出行）都要做：
+
+```cpp
+ObISRDaaTDimIter **dim_iters_arr = next_round_cnt_ > 0 ? &dim_iters_->at(0) : nullptr;
+const double *dim_weights_arr = ... ? &iter_param_->dim_weights_->at(0) : nullptr;
+```
+
+`ObIArrayWrap::at()` 是带边界检查的虚函数。这两个数组在 `init()` 成功后就不再变化，所以改成在
+`init()` 里解析一次、存进 `dim_iters_arr_` / `dim_weights_arr_` 两个成员，热路径直接用。
+`reset()` 里一并置空。
+
+这一改动是 `perf annotate` 看出来的：`fill_merge_heap` 的入口处就是两条
+`call ObIArrayWrap<...>::at(long)`（符号被 ICF 显示成 `ObAccuracy::at`），以及 2.7% 的
+`push %rbp` / 1.9% 的 `at()` 调用本身。
+
+### 12.2 验证
+
+正确性：hits 8001 / 11000 / 7332 / 20 不变。
+
+交错 A/B（6 轮，每查询 400 次，devirt2 = 本改动，devirt = 上一版；第 2 轮与本轮无关地被机器抖动污染，
+已经剔除）：
+
+| 指标 | devirt2 均值 | devirt 均值 | 变化 |
+| --- | --- | --- | --- |
+| query_cn | 2178.7 µs | 2200.8 µs | −1.0% |
+| query_beng | 2859.0 µs | 2878.8 µs | −0.7% |
+| query_mixed | 2153.0 µs | 2162.7 µs | −0.4% |
+| query_limit | 噪声 ±15% | — | 无结论 |
+
+cn 在 6 轮里有 5 轮更快，方向一致。
+
+### 12.3 教训
+
+和 §11.3 一致：单个虚调用只值 ~2ns，所以「每行省两次虚调用」的量级就是 1%。这类改动必须靠
+**多轮交错、看方向一致性**来判定，绝对值不可信（同一台机器同一二进制，不同轮次能差 10%）。
