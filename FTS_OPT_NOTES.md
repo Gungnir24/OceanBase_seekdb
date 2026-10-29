@@ -391,3 +391,18 @@ beng 的 FTS 开销里 JSON 打包约占 25%（`pack_json_res` 3.09% + 序列化
 
 这也说明：剩下的都是 1~2% 量级的改动，已经接近本机测量噪声（±3~5%）的下限。
 以后做这类改动，必须用「多轮交错 + 全部同向」来判定，单轮结果不可信。
+
+### 11.4 官方全流程（LABEL=devirt-full，SKIP_LOAD=0，SAMPLES=3，WARMUP=30）
+
+`git_dirty=1`（当时容器工作树即本提交内容），无崩溃，hits 8001 / 11000 / 7332 / 20：
+
+| 指标 | 数值 |
+| --- | --- |
+| select1_avg_ms | 0.1613 |
+| build_ik_all / ik_content / beng_en | 4.180 / 3.143 / 1.635 s |
+| tokenize_ik / beng | 0.2606 / 0.1896 ms |
+| query_cn / beng / mixed / limit | 2.0182 / 2.8806 / 2.2044 / 3.0279 ms |
+
+与上一版同一台机器的官方记录（select1 0.1534）相比：cn −5.2%、beng −2.4%、mixed −5.9%，
+limit +9.8%（limit 单次波动大，交错 A/B 里是 −2.1%）。**因本机 select1 本轮反而慢了 5%，
+这些数字只能看方向，不能看绝对值。**
