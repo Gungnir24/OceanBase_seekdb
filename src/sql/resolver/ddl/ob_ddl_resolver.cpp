@@ -7747,9 +7747,6 @@ int ObDDLResolver::set_partition_name_in_hashset(const ObPartitionNameHashWrappe
   return ret;
 }
 
-// Parallelism used for DDL statements that do not specify one themselves.
-static constexpr uint64_t DDL_DEFAULT_PARALLELISM = 6;
-
 int ObDDLResolver::calc_ddl_parallelism(const uint64_t hint_parallelism, const uint64_t table_dop, uint64_t &parallelism)
 {
   int ret = OB_SUCCESS;
@@ -7765,16 +7762,9 @@ int ObDDLResolver::calc_ddl_parallelism(const uint64_t hint_parallelism, const u
       } else {
         if (OB_FAIL(session_info_->get_enable_parallel_ddl(enable_parallel_ddl))) {
         } else if (enable_parallel_ddl) {
-          parallelism = MAX(table_dop, DDL_DEFAULT_PARALLELISM);
+          parallelism = table_dop;
         } else {
-          // DDLs that have a parallel phase (the fulltext index build scans the
-          // base table and tokenizes every row, which is by far the dominant
-          // cost) used to fall back to a single worker when no parallelism was
-          // requested, leaving the machine mostly idle.  Six is the measured
-          // sweet spot for that build: it is where the scan/tokenize phase
-          // saturates, while more workers only add contention in the serial
-          // merge/write phase.
-          parallelism = DDL_DEFAULT_PARALLELISM;
+          parallelism = 1;
         }
       }
     }
