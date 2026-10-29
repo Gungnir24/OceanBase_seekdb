@@ -208,3 +208,83 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
 
 **教训**：形参和成员同名传递（`f(param.member_)` 而形参 `const T &`）时，函数内对成员的写回会
 改变"入参"，所有基于入参的判断都必须在写回前求值。
+
+## 10. 第二轮迭代（2026-10-30）：版本表与已关闭的方向
+
+### 10.1 提测版本
+
+| 顺序 | commit | 内容 | 结果 |
+| --- | --- | --- | --- |
+| 1 | `cedf47083` | 修 props 缓存别名 bug（TOKENIZE -45%） | 采纳 |
+| 2 | `6a750f3d3` | 文档 | — |
+| 3 | `c23b7cb0e` | 词典字符→词码/区间缓存 | **回退（段错误）** |
+| 4 | `d9da3853c` | 回退上一条 | 修复 |
+| 5 | `2ff6781f0` | BOOL(relevance) 过滤快路径（查询 -5%） | 采纳 |
+| 6 | `c05264e89` | 区间词典二分查找（ik 语句 -1.2%） | 采纳 |
+| 7 | `11072b6c5` | 去掉 IK arbitrator 链表的无用闩锁（ik 语句 -1.0%） | 采纳 |
+
+**当前提测点 = `11072b6c5`（分支 `fts-final`）。** 上面的顺序是提交顺序，
+`d9da3853c` 必须留在链上（它撤掉的那版会让建索引时段错误）。
+
+### 10.2 官方口径的当前成绩（本地，同机 base ↔ 当前）
+
+用文档 §3.4 的原命令（`SKIP_LOAD=0`、`SAMPLES=3`、`WARMUP=30`）各跑一整轮：
+
+| 指标 | base | 当前 | 变化 |
+| --- | --- | --- | --- |
+| build_ik_all_sec | 6.812 | 3.968 | -41.8% |
+| build_ik_content_sec | 5.360 | 3.039 | -43.3% |
+| build_beng_en_sec | 2.338 | 1.640 | -29.9% |
+| tokenize_ik_avg_ms | 0.2846 | 0.2242 | -21.2% |
+| tokenize_beng_avg_ms | 0.1867 | 0.1729 | -7.4% |
+| query_cn_avg_ms | 2.3145 | 1.9088 | -17.5% |
+| query_beng_avg_ms | 3.399 | 2.7577 | -18.9% |
+| query_mixed_avg_ms | 2.5917 | 2.0882 | -19.4% |
+| query_limit_avg_ms | 2.9915 | 2.7478 | -8.2% |
+
+local score 显示 100 分是**没有意义**的（本地机器远快于 CI 基线机器），只能看 base↔当前 的比值。
+
+### 10.3 已关闭的方向：词典字符缓存（试了两次，都不采纳）
+
+1. **第一次**：把缓存放进 `ObFTDATReader` / `ObFTRangeDict` 对象里（`mutable` 数组成员）。
+   建索引时 PX worker 段错误：`destroy()` 析构子词典后缓存里还留着指针，且对象在多线程下共享，
+   无锁写入会产生"键命中旧值、指针已是新值"的撕裂组合。
+2. **第二次**：改成 `thread_local` + 用「词典类型 + 区间序号 + 块内 word_num_/node_num_」
+   做不可变身份，不跨对象保存任何指针。语义正确（md5 一致）但**零收益**。
+
+零收益的原因不是设计问题，而是**目标函数选错了**（见 10.4）：
+
+- `ObDictCacheValue::deep_copy()` 每次都把整个 DAT 块 `MEMCPY` 到新内存
+  （`src/storage/fts/dict/ob_ft_cache.h:111`），所以按块地址做键永远不命中；
+- 按不可变身份做键确实能命中，但 `get_word_code` 在 TOKENIZE 路径上**根本不是热点**：
+  用「命中时故意返回 code+1」的探针二进制跑同一条语句，输出逐字节不变，说明命中次数为 0，
+  而统计探针在 12 万条语句里一次都没触发计数上限——即该函数在整条路径上只被调用很少几次。
+
+结论：词典匹配的开销在 **`match_with_hit` 的 trie 走查**（base/check 数组随机访问，大表必然
+cache miss），不在词码解析。这条路不再投入。
+
+### 10.4 测量陷阱（重要，本轮踩到两次）
+
+**这个二进制做了 ICF（相同代码折叠），`perf` 的扁平符号名不可信。**
+`ObFTDATReader<void>::get_word_code` 在扁平视图里长期占 3%~4%，但实际它根本没被调用
+（见 10.3 的探针实验）。小函数会被折叠到同一地址，采样落到哪个名字上是随机的。
+
+可靠的用法只有两种：
+
+1. **inclusive（`--children -g graph`）+ 只看大节点**：`eval_tokenize → tokenize_fulltext →
+   segment → process_next_batch → do_process` 这条链的占比是可信的；
+2. **探针二进制**：故意把某条路径的结果改错，看输出变不变，以此判断它是否在热路径上。
+
+ik 的真实分布（inclusive，占整条语句）：`segment` 28.5%，其中 `process_next_batch` 21.3%
+（`do_process` 12.1%、arbitrator 3.6%、quantifier 1.0%），`tokenize_fulltext` 另有约 1.9%
+在结果 JSON 打包上。beng 那边 JSON 打包占比高得多（`pack_json_res` 3.1% + 序列化 2.8% +
+建数组 1.0%，合计约 43% 的 FTS 开销）。
+
+### 10.5 下一步（按收益/风险排序）
+
+1. **TOKENIZE 结果直出二进制 JSON**（beng 收益最大，约 4~6 分）：现在先建 `ObJsonArray` +
+   每 token 一个 `ObJsonString` 节点，再整棵树序列化；可以按定长头 + 长度前缀直接拼。
+   验证方式天然可靠——输出字节必须完全一致（token dump md5）。
+2. **建索引的字符串比较改排序规则**（§9.1 仍未做，收益最大但风险最高，需要语义等价性证明）。
+3. 长尾：`ObCharset::get_charset`（每次 `first_valid_char`/`hash` 内部都会取一次）、
+   `__memcmp_avx2` 在 `find_first_char_range` 里的区间端点比较。
