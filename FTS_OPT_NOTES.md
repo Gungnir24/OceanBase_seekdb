@@ -177,3 +177,34 @@ SSTable 编码与校验和。
 3. **TOKENIZE 的剩余 40 us**：DAT 树匹配的路径压缩、词表 hash 换成开地址、结果 JSON
    改成预分配 buffer 直接拼装。
 4. **`attach_rows` 里剩余的 `ObIArray::at()`**（建索引 2.4%）：把比较函数数组指针按批次取出。
+### 9.1 本轮已落地：props 缓存其实一直没生效（TOKENIZE -45%）
+
+上一版加的 `ObTokenizeSetupCache` 里有一条路径是死的：
+
+```cpp
+int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &properties)
+```
+
+它的调用方是 `param.reform_parser_properties(param.properties_)`，形参 `properties` **就是**成员
+`properties_` 的别名。慢路径最后一步 `to_format_json(allocator_, properties_)` 会把成员改写掉，
+于是紧跟着那句 `else if (properties.empty())`（决定是否把结果放进缓存）永远为假 ——
+缓存一次都没被写入，每条 TOKENIZE 都在重做 init → parse → rebuild_props_for_ddl → to_format_json。
+
+修法是把判断提前快照：`const bool no_properties_specified = properties.empty();`
+
+按 benchmark 原文、40000 次重复实测（同一二进制、A/B 交替）：
+
+| 语句 | 修复前 | 修复后 | FTS 部分 |
+|---|---|---|---|
+| `tokenize(<ik 文本>,'ik')` | 0.2964 ms | 0.2281 ms | 0.1500 → 0.0827 ms（**-45%**） |
+| `tokenize(<beng 文本>,'beng')` | 0.1786 ms | 0.1726 ms | 0.0322 → 0.0266 ms（-17%） |
+
+`select1` 基线 0.1464 → 0.1454 ms（未变，说明改的确实是 FTS 部分）。
+正确性：80018 行 TOKENIZE 输出 md5 仍为 `d620a35c914c3b1c7c15ca36337a7208`，命中数
+8001 / 11000 / 7332 / 20 全部不变。
+
+建索引不受影响（暖态 3464/3468/3577/3664 vs 4066/3578/3563/3473，差异在噪声内）：DDL 生成列
+不走 `ObExprTokenize::parse_param`。
+
+**教训**：形参和成员同名传递（`f(param.member_)` 而形参 `const T &`）时，函数内对成员的写回会
+改变"入参"，所有基于入参的判断都必须在写回前求值。
