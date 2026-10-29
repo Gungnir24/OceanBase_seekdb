@@ -813,3 +813,79 @@ hits 8001 / 11000 / 7332 / 20；token dump `lines=80018 md5=d620a35c914c3b1c7c15
 
 `query_limit` 几乎没动，因为它只取 20 行、单次查询时间主要花在框架与首批投递上，
 每行级别的优化对它几乎无感。
+
+## 19. 第十轮：维度迭代器走具体类型（内联两个访问器）
+
+### 19.1 改动
+
+`fill_merge_heap()` 每行每维度要发 3 次虚调用（`get_next_row` / `get_curr_score` / `get_curr_id`），
+其中后两个的实现只是「一次边界检查 + 一次数组成员读取」：
+
+```cpp
+int ObTextRetrievalDaaTTokenIter::get_curr_score(double &score) const
+{
+  if (OB_UNLIKELY(cur_idx_ >= count_)) { ret = OB_ARRAY_OUT_OF_RANGE; }
+  else if (relevance_expr_) { score = relevance_[cur_idx_]; }
+}
+int ObTextRetrievalDaaTTokenIter::get_curr_id(const ObDatum *&id_datum) const
+{
+  if (OB_UNLIKELY(cur_idx_ >= count_)) { ret = OB_ARRAY_OUT_OF_RANGE; }
+  else { id_datum = &doc_id_[cur_idx_].get_datum(); }
+}
+```
+
+关键点：`ob_sparse_daat_iter.cpp` 和 `ob_text_retrieval_token_iter.cpp` 在**同一个 unity TU** 里
+（`unity_ob_storage_ob_storage_retrieval_0_c___cxx.cxx`），所以只要拿到具体类型指针，这两个函数就能被内联。
+
+做法：
+
+- `init()` 里用 `dynamic_cast<ObTextRetrievalDaaTTokenIter *>` 检查是否**所有**维度都是这个类型，
+  结果存进 `all_text_token_iters_`（只在 init 判一次，热路径不付 RTTI 代价）；
+- `fill_merge_heap()` 在标志为真时走一条 `static_cast` 到具体类型的循环副本，否则走原接口循环。
+
+### 19.2 验证
+
+hits 8001 / 11000 / 7332 / 20；`SUM(MATCH(...))` 仍是 `8707.764724`；token dump
+`lines=80018 md5=d620a35c914c3b1c7c15ca36337a7208`。
+
+交错 A/B（4 轮，每查询 400 次）：
+
+| 轮次 | devirt8 (µs) | devirt7 (µs) |
+| --- | --- | --- |
+| 1 | 1952 / 2495 / 1898 | 1957 / 2477 / 1932 |
+| 2 | 1938 / 2482 / 1911 | 1965 / 2519 / 1982 |
+| 3 | 1938 / 2462 / 1891 | 2092 / 2510 / 1898 |
+| 4 | 1951 / 2455 / 1878 | 1975 / 2475 / 1900 |
+
+| 指标 | 均值 | 变化 |
+| --- | --- | --- |
+| query_cn | 1944.8 vs 1997.3 | **−2.6%**（4/4 轮） |
+| query_mixed | 1894.5 vs 1928.0 | **−1.7%**（4/4 轮） |
+| query_beng | 2473.5 vs 2495.3 | −0.9%（3/4 轮） |
+
+`query_limit` 这一轮波动极大（2775~5040 µs，双峰），无结论。
+
+### 19.3 官方全流程（LABEL=devirt8-full，SKIP_LOAD=0，SAMPLES=3）
+
+无崩溃，hits 8001 / 11000 / 7332 / 20，token dump 一致：
+
+| 指标 | 数值 |
+| --- | --- |
+| select1_avg_ms | 0.1584 |
+| build_ik_all / ik_content / beng_en | 4.176 / 3.338 / 1.734 s |
+| tokenize_ik / beng | 0.2575 / 0.1894 ms |
+| query_cn / beng / mixed / limit | **1.7463 / 2.4607 / 1.8981 / 2.8363 ms** |
+
+相对阶段起点（nolatch：2.1294 / 2.9520 / 2.3433 / 2.7575）：
+
+| 指标 | 起点 | 现在 | 变化 |
+| --- | --- | --- | --- |
+| query_cn | 2.1294 | 1.7463 | **−18.0%** |
+| query_beng | 2.9520 | 2.4607 | **−16.6%** |
+| query_mixed | 2.3433 | 1.8981 | **−19.0%** |
+| query_limit | 2.7575 | 2.8363 | +2.9%（噪声范围内） |
+
+### 19.4 说明
+
+`all_text_token_iters_` 只在**所有**维度都是该类型时置真，混合维度场景自动走原来的虚调用路径，
+所以这是一个纯粹的快路径，没有行为分叉风险。`dynamic_cast` 只在 `init()` 里执行。
