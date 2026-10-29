@@ -1105,3 +1105,50 @@ tokenize_ik 最多提升 4% 左右，折合 33.3 × 0.04 ≈ **1.3 分**（beng 
 - 文档提交：`29225bc50` `da0ede713` `b3bce6409` `715c75fd6` `fb6c35622` 及本提交
 - 最近两次官方全流程：`devirt8-full`、`green-p5`，均无崩溃、hits 与 token dump 一致
 - 累计查询提升（相对阶段起点）：cn −18.4%、beng −16.7%、mixed −18.4%
+
+## 25. 第十六轮：query_limit 为什么从头到尾没涨
+
+`query_limit` 是四个查询里唯一几乎没改善的（2.89 ms，比 mixed 的 1.91 ms 还慢）。
+第一次对它单独采样（600 次执行，20 秒），flat top 与另外三个 `COUNT(*)` 查询完全不同：
+
+| 占比 | 符号 |
+| --- | --- |
+| 4.54% | `datum_cmp::ObDatumStrCmp<CS_TYPE_UTF8MB4_BIN, false>::cmp` |
+| 4.53% | `__memcmp_avx2_movbe` |
+| 4.32% | `ObStringDiffDecoder::batch_decode` |
+| 4.00% | `ObSimpleRowsMerger<ObSRMergeItem, ObSRMergeCmp>::push` |
+| 3.70% | `__memmove_avx_unaligned_erms` |
+| **3.45%** | **`ObIArrayWrap<ObHashSet<unsigned long, ...>>::at(long)`** |
+| 3.44% | `ObExprBM25::eval_batch_bm25_relevance_expr` |
+| 1.99% | `ob_strnncollsp_binary` |
+| **1.81%** | **`ObIArrayWrap<int (*)(ObDatum const&, ObDatum const&, int&, ...)>::at(long) const`** |
+| 1.79% | `ObTextRetrievalDaaTTokenIter::advance_to` |
+
+### 25.1 结论
+
+另外三个查询是 `SELECT COUNT(*)`，**不投影任何列、不比较任何行键**，所以永远碰不到这些路径。
+而 `query_limit` 的形态是
+
+```sql
+SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(content) AGAINST(...) LIMIT 20) t
+```
+
+它要**投影 `id` 列**，于是 DAS 合并层必须对行键做**去重**：一个 `unsigned long` 的 `ObHashSet`
+（3.45%）加字符串比较链路（`ObDatumStrCmp<utf8mb4_bin>` + `memcmp` + `strnncollsp_binary`，
+合计约 **11%**）。这部分开销与我们的迭代器无关，所以之前所有针对稀疏检索热循环的优化对它都没有效果。
+
+### 25.2 下一步（留给上下文充足的轮次）
+
+两条都在这 11% 里，且都是「`.at()` 未内联」这一族问题：
+
+1. `ObIArrayWrap<ObHashSet<...>>::at(long)`（3.45%）——**每行一次未内联的数组访问**，
+   和 §13/§14/§19 里修掉的是同一类问题，只是发生在框架侧的去重逻辑里；
+2. `ObIArrayWrap<int(*)(...)>::at(long)`（1.81%）——取比较函数指针也走 `.at()`。
+
+即使只修第 1 条，按 3.45% 估算也能给 `query_limit` 带来 3% 左右的提升（≈ 0.5 分），
+但需要先定位框架里这两个数组的持有者，属于跨模块改动，必须在一次完整的轮次里做。
+
+### 25.3 本轮状态
+
+未改代码（只做了针对性的 profile 归因）。`fts-final` 仍停留在 `339ff468b`，代码为 devirt8，
+最近一次官方全流程 `green-p5` 无崩溃、hits 与 token dump 一致。
