@@ -1045,3 +1045,33 @@ tokenize_ik 最多提升 4% 左右，折合 33.3 × 0.04 ≈ **1.3 分**（beng 
 
 本轮只做量化，未改代码：`fts-final` 保持 `da0ede713` 之后的文档提交，
 代码仍是 devirt8（官方全流程无崩溃）。
+
+## 23. 第十四轮：绿色复确认 + 现状收口
+
+三次纯文档提交之后，用当前代码（devirt8）重跑一次完整官方流程 `LABEL=green-p5`：
+
+| 指标 | 数值 |
+| --- | --- |
+| select1_avg_ms | 0.1618 |
+| build_ik_all / ik_content / beng_en | 4.277 / 3.240 / 1.734 s |
+| tokenize_ik / beng | 0.2537 / 0.1906 ms |
+| query_cn / beng / mixed / limit | 1.7381 / 2.4578 / 1.9111 / 2.8895 ms |
+
+- hits 8001 / 11000 / 7332 / 20；
+- token dump `lines=80018 md5=d620a35c914c3b1c7c15ca36337a7208`；
+- err 输出与 server 日志中 segmentation / signal / core dumped 计数均为 0。
+
+与 `devirt8-full` 相比四项查询分别是 1.7381 vs 1.7463、2.4578 vs 2.4607、1.9111 vs 1.8981、
+2.8895 vs 2.8363，**复现性良好**（差异都在 ±2% 噪声内）。
+
+### 23.1 当前提测点
+
+- 代码：`65076298d`（devirt8），其后 4 个提交只有 `FTS_OPT_NOTES.md`；
+- 官方全流程最近两次（`devirt8-full`、`green-p5`）均无崩溃、hits 与 token dump 一致。
+
+### 23.2 未完成项与下一步
+
+唯一还有量级空间的是 §22 的 JSON 直出（tokenize 整体约 40% 在这条链上）。
+它需要改 `tokenize_fulltext` 的构造方式并逐字节对齐 `ObJsonBin` 布局，
+属于 SQL 层深水区，应在一个完整的、上下文充足的轮次里单独做，
+并用 `tokdump` 的 md5 作为硬约束。
