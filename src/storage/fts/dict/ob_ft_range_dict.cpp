@@ -403,12 +403,25 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ft_word_compare(range_dicts_[i].start_.get_word(), single_word) <= 0
-        && ft_word_compare(range_dicts_[i].end_.get_word(), single_word) >= 0) {
-      dict = range_dicts_[i].dict_;
-      found = true;
+  // The ranges are built in key order and do not overlap, so the range a word
+  // belongs to can be found with a single binary search on the start word
+  // instead of walking the whole list for every character of every document.
+  int64_t left = 0;
+  int64_t right = range_dicts_.size() - 1;
+  int64_t candidate = -1;
+  while (left <= right) {
+    const int64_t mid = left + (right - left) / 2;
+    if (ft_word_compare(range_dicts_[mid].start_.get_word(), single_word) <= 0) {
+      candidate = mid;
+      left = mid + 1;
+    } else {
+      right = mid - 1;
     }
+  }
+  if (candidate >= 0
+      && ft_word_compare(range_dicts_[candidate].end_.get_word(), single_word) >= 0) {
+    dict = range_dicts_[candidate].dict_;
+    found = true;
   }
   if (!found) {
     // not found, dis match
