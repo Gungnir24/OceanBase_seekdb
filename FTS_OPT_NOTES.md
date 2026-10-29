@@ -280,11 +280,73 @@ ik 的真实分布（inclusive，占整条语句）：`segment` 28.5%，其中 `
 在结果 JSON 打包上。beng 那边 JSON 打包占比高得多（`pack_json_res` 3.1% + 序列化 2.8% +
 建数组 1.0%，合计约 43% 的 FTS 开销）。
 
-### 10.5 下一步（按收益/风险排序）
+### 10.5 补充：查询基准到底在测什么（决定了一切优化是否值得做）
 
-1. **TOKENIZE 结果直出二进制 JSON**（beng 收益最大，约 4~6 分）：现在先建 `ObJsonArray` +
-   每 token 一个 `ObJsonString` 节点，再整棵树序列化；可以按定长头 + 长度前缀直接拼。
-   验证方式天然可靠——输出字节必须完全一致（token dump md5）。
-2. **建索引的字符串比较改排序规则**（§9.1 仍未做，收益最大但风险最高，需要语义等价性证明）。
-3. 长尾：`ObCharset::get_charset`（每次 `first_valid_char`/`hash` 内部都会取一次）、
+四个查询指标全部是 **`SELECT COUNT(*)`**，没有 ORDER BY，也不投影相关性列：
+
+```sql
+query_cn:    SELECT COUNT(*) FROM docs WHERE MATCH(title, content) AGAINST('全文索引 分词器');
+query_beng:  SELECT COUNT(*) FROM docs WHERE MATCH(title_en, content_en) AGAINST('database performance audit');
+query_mixed: SELECT COUNT(*) FROM docs WHERE MATCH(title, content) AGAINST('OceanBase 稳定 database');
+query_limit: SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20) t;
+```
+
+所以 ①BM25 分数对结果没有任何影响，②`LIMIT 20` 的排序不改变计数。
+
+### 10.6 已关闭：不算相关性（norel）
+
+依据上面的观察，试过完整的不算相关性方案（`/work/seekdb.norel2`）：
+
+- 计划期：`need_calc_relevance = (mode != NATURAL_LANGUAGE_MODE) || 语句有 ORDER BY
+  || 选择列表里出现 MATCH 表达式`；
+- 执行期：用一个丢弃分数的 collector，`doc_agg_ctdef` 为空时跳过 BM25 统计与总文档数扫描。
+
+**结果正确**（hits 仍是 8001 / 11000 / 7332 / 20），但**耗时是平的**：
+
+| | norel2 | 当前 | |
+| --- | --- | --- | --- |
+| query_cn | 2.66 ms | 2.79 ms | −4.7% |
+| query_beng | 3.18 ms | 3.24 ms | −1.9% |
+| query_mixed | 2.39 ms | 2.25 ms | +6.3% |
+| query_limit | 3.48 ms | 3.34 ms | +4.2% |
+
+（交错两轮平均，单轮噪声约 ±20%，所以整体就是噪声。）
+
+**结论**：BM25 打分和文档数聚合不是这些查询的成本所在，成本在**倒排表本身的扫描解码**
+（`ObTextRetrievalDaaTTokenIter::get_next_row` 占查询 24.7%，其下是宏块字符串解码器
+`ObStringDiffDecoder::batch_decode`）。这条路彻底关闭，不要再试。
+
+### 10.7 已关闭：TOKENIZE 结果直出二进制 JSON
+
+beng 的 FTS 开销里 JSON 打包约占 25%（`pack_json_res` 3.09% + 序列化 2.77% + 建数组 0.95%）。
+本想跳过“建 JSON 树 → `parse_tree` 再序列化一遍”，直接拼二进制。读了实现后放弃：
+
+- 根节点要写 `ObJsonBinDocHeader`，然后是 `ObJsonBinMeta`——它的 element_count / obj_size /
+  entry 的**变长编码**（`ObJsonVar::get_var_type` 决定 1/2/4 字节）再叠加每个元素的偏移表；
+- 复刻错一个字节，客户端拿到的就是坏 JSON；一个来回就是一次 20 分钟的重编译。
+
+收益约 +5 分，风险和成本都不成比例。若以后要做，正确做法是**保留树、只减少节点**
+（例如让 `make_token_array_json` 复用节点池），而不是重写格式。
+
+### 10.8 下一步（按收益/风险排序）
+
+1. **建索引的字符串比较改排序规则**（§9.1 仍未做，收益最大但风险最高，需要语义等价性证明）。
+   已经量到的证据：建索引的排序比较器占 18.9%（`ObSortOpImpl::Compare`），其中
+   `ObNullSafeDatumStrCmp<utf8mb4_general_ci>` + `ob_strnncollsp_utf8mb4` 约 11.5%。
+   注意 ASCII 首字节快路径对 CJK 无效（首字节都是 0xE4~0xE9），只对 beng 有用，值不到 1 分。
+2. 长尾：`ObCharset::get_charset`（每次 `first_valid_char`/`hash` 内部都会取一次）、
    `__memcmp_avx2` 在 `find_first_char_range` 里的区间端点比较。
+3. 查询侧的剩余成本在倒排表扫描解码，属于存储格式，暂不动。
+
+### 10.9 建索引的成本结构（一次采样，inclusive，占 PX worker 时间）
+
+| 环节 | 占比 | 说明 |
+| --- | --- | --- |
+| `ObPxMultiPartSSTableInsertOp::write_ordered_slice_by_row` | 50.9% | 其中拉取子算子 34.4%、写 SSTable 15.5% |
+| `ObSortOp::process_sort_batch` | 28.7% | 其中 `sort_inmem_data` 19.4%、`do_dump` 6.3% |
+| `ObSortOpImpl::Compare::operator()` | 18.9% | 排序比较器（字符串排序规则） |
+| `ObTableScanOp::inner_get_next_fts_index_row` | 20.0% | 读文档 + 分词，生成倒排行 |
+| `ObMacroBlockWriter::build_micro_block` | 8.9% | 微块编码（`ObDirectInsertWriterAdapter` 15.5%） |
+
+结论：建索引已经没有“一块肥肉”，剩下的是排序比较（18.9%）和存储编码（15%），两者都要改语义
+或存储格式才动得了。
