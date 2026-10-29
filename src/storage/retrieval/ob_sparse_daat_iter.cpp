@@ -306,8 +306,12 @@ int ObSRDaaTIterImpl::fill_merge_heap()
   // is resolved there instead of once per dimension per round.
   ObISRDaaTDimIter **dim_iters_arr = dim_iters_arr_;
   const double *dim_weights_arr = dim_weights_arr_;
+  // The two fixed arrays below are also fixed after init(); their operator[] forwards to the
+  // polymorphic at(), so index their raw storage instead of paying it once per element.
+  const int64_t *iter_idxes = next_round_iter_idxes_.get_data();
+  const ObDatum **domain_ids = iter_domain_ids_.get_data();
   for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
-    const int64_t iter_idx = next_round_iter_idxes_[i];
+    const int64_t iter_idx = iter_idxes[i];
     ObISRDaaTDimIter *dim_iter = nullptr;
     if (OB_ISNULL(dim_iter = dim_iters_arr[iter_idx])) {
       ret = OB_ERR_UNEXPECTED;
@@ -319,11 +323,9 @@ int ObSRDaaTIterImpl::fill_merge_heap()
       }
     } else if (OB_FAIL(dim_iter->get_curr_score(item.relevance_))) {
     } else if (OB_NOT_NULL(dim_weights_arr) && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * dim_weights_arr[iter_idx])) {
-    } else if (OB_FAIL(dim_iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
+    } else if (OB_FAIL(dim_iter->get_curr_id(domain_ids[iter_idx]))) {
     } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
     } else if (OB_FAIL(push_merge_item(item))) {
-    } else {
-      LOG_DEBUG("push item to merge heap", K(ret), K(i), K(iter_idx), K(next_round_cnt_), K(item), K(iter_domain_ids_[iter_idx]));
     }
   }
 
@@ -347,6 +349,10 @@ int ObSRDaaTIterImpl::collect_dims_by_id(const ObDatum *&id_datum, double &relev
   relevance = 0.0;
   got_valid_id = false;
 
+  // next_round_iter_idxes_ and iter_domain_ids_ never move after init(); index their raw storage
+  // instead of going through the polymorphic operator[] once per collected dimension.
+  int64_t *next_idxes = next_round_iter_idxes_.get_data();
+  const ObDatum **domain_ids = iter_domain_ids_.get_data();
   ObSRSimpleMerger *simple_merge = simple_merge_heap_;
   if (OB_NOT_NULL(simple_merge)) {
     while (OB_SUCC(ret) && !simple_merge->empty() && !curr_doc_end) {
@@ -358,7 +364,7 @@ int ObSRDaaTIterImpl::collect_dims_by_id(const ObDatum *&id_datum, double &relev
       } else if (FALSE_IT(iter_idx = top_item->iter_idx_)) {
       } else if (OB_FAIL(simple_merge->pop())) {
       } else {
-        next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
+        next_idxes[next_round_cnt_++] = iter_idx;
       }
     }
   } else {
@@ -371,13 +377,13 @@ int ObSRDaaTIterImpl::collect_dims_by_id(const ObDatum *&id_datum, double &relev
       } else if (FALSE_IT(iter_idx = top_item->iter_idx_)) {
       } else if (OB_FAIL(merge_heap_->pop())) {
       } else {
-        next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
+        next_idxes[next_round_cnt_++] = iter_idx;
       }
     }
   }
 
   if (OB_SUCC(ret)) {
-    id_datum = iter_domain_ids_[iter_idx];
+    id_datum = domain_ids[iter_idx];
     if (OB_ISNULL(id_datum)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(relevance_collector_->get_result(relevance, got_valid_id))) {
@@ -450,8 +456,9 @@ int ObSRDaaTIterImpl::cache_result(int64_t &count, const ObDatum &id_datum, cons
   } else if (OB_UNLIKELY(count >= buffered_domain_ids_.count() || count >= buffered_relevances_.count())) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    buffered_domain_ids_[count].from_datum(id_datum);
-    buffered_relevances_[count] = relevance;
+    // operator[] forwards to the polymorphic at(); these arrays never move, so index the raw storage.
+    buffered_domain_ids_.get_data()[count].from_datum(id_datum);
+    buffered_relevances_.get_data()[count] = relevance;
     ++count;
     ++output_row_cnt_;
     if (limit_param->is_valid() && output_row_cnt_ >= limit) {
