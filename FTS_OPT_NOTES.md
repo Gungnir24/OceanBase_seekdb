@@ -740,3 +740,76 @@ need_project = (0 != relevance);
 | 2.3% | `project_results` | 每行一次 `set_datum_func_` 间接调用 |
 
 剩下的都是 1~2% 量级、且多数在存储解码与 SQL 框架里，**已经没有 5% 以上的单点**。
+
+## 18. 第九轮：补回 §14 丢失的改动（本轮最大收益）+ 工作流事故复盘
+
+### 18.1 事故：§14 只有 1/4 真正落地
+
+排查 `devirt6` 的 `perf annotate` 时发现 `fill_merge_heap` 里仍然有
+`call ObIArrayWrap<...>::at(long)`（1.81%），但按 §14 的描述那里早就该没有 `at()` 了。
+
+回看当时的操作顺序，事故是这样发生的：
+
+1. 在主机上改了 `.cpp` 的 `fill_merge_heap` 和 `cache_result`（**只在主机**）；
+2. 然后在**容器里**用脚本给 `project_results` 打补丁（此时容器里还是旧文件）；
+3. 编译通过后，把**容器**的文件 `docker cp` 回主机。
+
+第 3 步覆盖了第 1 步的两处改动。最终提交里只有 `project_results` 的那一处真正落地，
+而 commit message 写的是三处都在。这也解释了为什么 §14 的 A/B 只有 beng 有反应
+（`project_results` 是按批调用、beng 行数最多的那个）。
+
+**流程教训**：以主机为唯一源，`docker cp` 之后**在容器里 `grep` 确认改动到位再编译**；
+任何时候不要直接改容器里的源码。
+
+### 18.2 补回的改动
+
+- `fill_merge_heap()`：`next_round_iter_idxes_` / `iter_domain_ids_` 改裸数组；
+  删掉每个维度都要调一次 `need_to_print()` 的 `LOG_DEBUG`；
+- `cache_result()`：`buffered_domain_ids_` / `buffered_relevances_` 改裸数组；
+- `collect_dims_by_id()`（本次新增，原计划没有）：每收集一个维度就要写一次
+  `next_round_iter_idxes_[next_round_cnt_++]`、每行读一次 `iter_domain_ids_[iter_idx]`，同样改裸数组。
+
+### 18.3 验证
+
+hits 8001 / 11000 / 7332 / 20；token dump `lines=80018 md5=d620a35c914c3b1c7c15ca36337a7208`。
+
+交错 A/B（4 轮，每查询 400 次，**四个指标四轮全部同向**）：
+
+| 轮次 | devirt7 (µs) | devirt6 (µs) |
+| --- | --- | --- |
+| 1 | 1996 / 2493 / 1943 / 2783 | 2097 / 2660 / 2040 / 3460 |
+| 2 | 1997 / 2477 / 1927 / 2782 | 2072 / 2748 / 2034 / 2811 |
+| 3 | 1964 / 2473 / 1973 / 2760 | 2052 / 2616 / 2049 / 2815 |
+| 4 | 1997 / 2507 / 1946 / 2804 | 2112 / 2666 / 2053 / 2804 |
+
+| 指标 | 均值 | 变化 |
+| --- | --- | --- |
+| query_cn | 1988.5 vs 2083.3 | **−4.6%** |
+| query_beng | 2487.5 vs 2672.5 | **−6.9%** |
+| query_mixed | 1947.3 vs 2044.0 | **−4.7%** |
+| query_limit | 2782.3 vs 2810.0* | −1.0% |
+
+*剔除第 1 轮旧版 3460 µs 的离群值。
+
+### 18.4 官方全流程（LABEL=devirt7-full，SKIP_LOAD=0，SAMPLES=3）
+
+无崩溃，hits 8001 / 11000 / 7332 / 20，token dump 一致：
+
+| 指标 | 数值 |
+| --- | --- |
+| select1_avg_ms | 0.1559 |
+| build_ik_all / ik_content / beng_en | 4.172 / 3.241 / 1.735 s |
+| tokenize_ik / beng | 0.2592 / 0.1898 ms |
+| query_cn / beng / mixed / limit | **1.7726 / 2.5070 / 1.9230 / 2.7514 ms** |
+
+与阶段起点（nolatch：2.1294 / 2.9520 / 2.3433 / 2.7575）相比：
+
+| 指标 | 起点 | 现在 | 变化 |
+| --- | --- | --- | --- |
+| query_cn | 2.1294 | 1.7726 | **−16.8%** |
+| query_beng | 2.9520 | 2.5070 | **−15.1%** |
+| query_mixed | 2.3433 | 1.9230 | **−17.9%** |
+| query_limit | 2.7575 | 2.7514 | −0.2% |
+
+`query_limit` 几乎没动，因为它只取 20 行、单次查询时间主要花在框架与首批投递上，
+每行级别的优化对它几乎无感。
