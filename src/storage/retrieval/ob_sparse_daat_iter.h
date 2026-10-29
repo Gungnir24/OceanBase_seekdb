@@ -93,12 +93,27 @@ protected:
   virtual int cache_result(int64_t &count, const ObDatum &id_datum, const double relevance);
   virtual int project_results(const int64_t count);
   int init_merge_heap(const int64_t count);
+  // The merge heap is accessed several times per output row.  When it is the simple merger (the
+  // usual case: at most ObSRSimpleMerger::USE_SIMPLE_MERGER_MAX_TABLE_CNT dimensions) the concrete
+  // pointer lets these devirtualize and inline; otherwise fall back to the interface.
+  OB_INLINE bool merge_heap_empty() const
+  {
+    return OB_NOT_NULL(simple_merge_heap_) ? simple_merge_heap_->empty() : merge_heap_->empty();
+  }
+  OB_INLINE int push_merge_item(const ObSRMergeItem &item)
+  {
+    return OB_NOT_NULL(simple_merge_heap_) ? simple_merge_heap_->push(item) : merge_heap_->push(item);
+  }
 protected:
   ObIAllocator *iter_allocator_;
   ObSparseRetrievalMergeParam *iter_param_;
   ObIArray<ObISRDaaTDimIter *> *dim_iters_;
   ObSRMergeCmp merge_cmp_;
   ObSRMergeHeap *merge_heap_;
+  // Kept in addition to merge_heap_ for the common case of a handful of dimensions: with a
+  // concrete pointer the merger calls (empty / top / pop / push) devirtualize and inline, and
+  // they are executed several times per output row.
+  ObSRSimpleMerger *simple_merge_heap_;
   ObSRDaaTRelevanceCollector *relevance_collector_;
   ObFixedArray<const ObDatum *, ObIAllocator> iter_domain_ids_; // record every dim iter's output domain id, one (ObDatum *) for one dim iter
   ObFixedArray<ObDocIdExt, ObIAllocator> buffered_domain_ids_; // cache for output

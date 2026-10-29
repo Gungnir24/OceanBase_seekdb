@@ -76,6 +76,7 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     dim_iters_(nullptr),
     merge_cmp_(),
     merge_heap_(nullptr),
+    simple_merge_heap_(nullptr),
     relevance_collector_(nullptr),
     iter_domain_ids_(),
     buffered_domain_ids_(),
@@ -159,6 +160,7 @@ void ObSRDaaTIterImpl::reset()
     merge_heap_->~ObSRMergeHeap();
     merge_heap_ = nullptr;
   }
+  simple_merge_heap_ = nullptr;
   if (OB_NOT_NULL(relevance_collector_)) {
     relevance_collector_->reset();
     relevance_collector_ = nullptr;
@@ -309,14 +311,14 @@ int ObSRDaaTIterImpl::fill_merge_heap()
     } else if (OB_NOT_NULL(dim_weights_arr) && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * dim_weights_arr[iter_idx])) {
     } else if (OB_FAIL(dim_iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
     } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
-    } else if (OB_FAIL(merge_heap_->push(item))) {
+    } else if (OB_FAIL(push_merge_item(item))) {
     } else {
       LOG_DEBUG("push item to merge heap", K(ret), K(i), K(iter_idx), K(next_round_cnt_), K(item), K(iter_domain_ids_[iter_idx]));
     }
   }
 
   if (OB_FAIL(ret)) {
-  } else if (merge_heap_->empty()) {
+  } else if (merge_heap_empty()) {
     ret = OB_ITER_END;
   } else if (0 != next_round_cnt_ && OB_FAIL(merge_heap_->rebuild())) {
   } else {
@@ -335,16 +337,32 @@ int ObSRDaaTIterImpl::collect_dims_by_id(const ObDatum *&id_datum, double &relev
   relevance = 0.0;
   got_valid_id = false;
 
-  while (OB_SUCC(ret) && !merge_heap_->empty() && !curr_doc_end) {
-    if (merge_heap_->is_unique_champion()) {
-      curr_doc_end = true;
+  ObSRSimpleMerger *simple_merge = simple_merge_heap_;
+  if (OB_NOT_NULL(simple_merge)) {
+    while (OB_SUCC(ret) && !simple_merge->empty() && !curr_doc_end) {
+      if (simple_merge->is_unique_champion()) {
+        curr_doc_end = true;
+      }
+      if (OB_FAIL(simple_merge->top(top_item))) {
+      } else if (OB_FAIL(relevance_collector_->collect_one_dim(top_item->iter_idx_, top_item->relevance_))) {
+      } else if (FALSE_IT(iter_idx = top_item->iter_idx_)) {
+      } else if (OB_FAIL(simple_merge->pop())) {
+      } else {
+        next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
+      }
     }
-    if (OB_FAIL(merge_heap_->top(top_item))) {
-    } else if (OB_FAIL(relevance_collector_->collect_one_dim(top_item->iter_idx_, top_item->relevance_))) {
-    } else if (FALSE_IT(iter_idx = top_item->iter_idx_)) {
-    } else if (OB_FAIL(merge_heap_->pop())) {
-    } else {
-      next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
+  } else {
+    while (OB_SUCC(ret) && !merge_heap_->empty() && !curr_doc_end) {
+      if (merge_heap_->is_unique_champion()) {
+        curr_doc_end = true;
+      }
+      if (OB_FAIL(merge_heap_->top(top_item))) {
+      } else if (OB_FAIL(relevance_collector_->collect_one_dim(top_item->iter_idx_, top_item->relevance_))) {
+      } else if (FALSE_IT(iter_idx = top_item->iter_idx_)) {
+      } else if (OB_FAIL(merge_heap_->pop())) {
+      } else {
+        next_round_iter_idxes_[next_round_cnt_++] = iter_idx;
+      }
     }
   }
 
@@ -486,11 +504,13 @@ int ObSRDaaTIterImpl::init_merge_heap(const int64_t count)
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
       merge_heap_ = simple_merge;
+      simple_merge_heap_ = simple_merge;
     }
   } else if (OB_ISNULL(loser_tree = OB_NEWx(ObSRLoserTree, iter_allocator_, merge_cmp_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
     merge_heap_ = loser_tree;
+    simple_merge_heap_ = nullptr;
   }
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(merge_heap_->init(count, count, *iter_allocator_))) {

@@ -350,3 +350,44 @@ beng 的 FTS 开销里 JSON 打包约占 25%（`pack_json_res` 3.09% + 序列化
 
 结论：建索引已经没有“一块肥肉”，剩下的是排序比较（18.9%）和存储编码（15%），两者都要改语义
 或存储格式才动得了。
+
+## 11. 第三轮：合并堆去虚化（当前提测点）
+
+### 11.1 改动
+
+`ObSRDaaTIterImpl`（`src/storage/retrieval/ob_sparse_daat_iter.{h,cpp}`）里的 `merge_heap_` 是接口指针
+`ObRowsMerger<ObSRMergeItem, ObSRMergeCmp> *`，但每个输出行要经过它约 10 次虚调用
+（`empty` / `is_unique_champion` / `top` / `pop` / `push`，2 个维度时）。
+
+在维度数 <= `ObSRSimpleMerger::USE_SIMPLE_MERGER_MAX_TABLE_CNT`（3）时，实际对象总是
+`ObSimpleRowsMerger`。改动保留一个具体类型指针 `simple_merge_heap_`：
+
+- `init_merge_heap()` 里创建简单合并器时一起记下，创建 loser tree 时置空；
+- `reset()` 里一起清空（避免悬垂）；
+- 热路径 `collect_dims_by_id()` / `fill_merge_heap()`（`merge_heap_empty()` / `push_merge_item()` 两个
+  inline 包装）在具体指针非空时直接调用，编译器据此去虚化并内联；
+- 具体指针为空时走原来的接口路径，行为完全一致。
+
+### 11.2 验证
+
+- 正确性：hits 8001 / 11000 / 7332 / 20 全部不变；token dump md5 不变
+  （`d620a35c914c3b1c7c15ca36337a7208`）。
+- 交错 A/B（同一数据目录、每轮重启、每查询 400 次、3 轮）：
+
+| 轮次 | devirt (µs) | 当前 (µs) |
+| --- | --- | --- |
+| 1 | 2202 / 2864 / 2163 / 3046 | 2238 / 2931 / 2189 / 2999 |
+| 2 | 2195 / 2864 / 2248 / 2693 | 2256 / 2895 / 2192 / 3009 |
+| 3 | 2232 / 2874 / 2192 / 3068 | 2269 / 2904 / 2200 / 2987 |
+
+（cn / beng / mixed / limit）
+
+- 均值：cn −2.0%，beng −1.5%，limit −2.1%，mixed +0.3%（噪声）。cn 和 beng 三轮全部同向。
+
+### 11.3 结论与教训
+
+收益只有约 2%，远低于“每行 10 次虚调用 × 6ns”的预估：现代 CPU 的间接跳转预测把稳定的
+虚调用压到了 ~2ns。**接口分派本身不是查询的主要成本**，主要成本仍在倒排表的读取解码。
+
+这也说明：剩下的都是 1~2% 量级的改动，已经接近本机测量噪声（±3~5%）的下限。
+以后做这类改动，必须用「多轮交错 + 全部同向」来判定，单轮结果不可信。
