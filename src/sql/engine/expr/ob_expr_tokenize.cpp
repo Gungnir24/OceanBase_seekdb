@@ -570,8 +570,12 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
   int ret = OB_SUCCESS;
   storage::ObFTParserJsonProps parser_properties;
   ObTokenizeSetupCache &setup_cache = ObTokenizeSetupCache::get_instance();
+  // `properties` is usually the caller's own param.properties_, and the slow path
+  // below overwrites that member.  Snapshot the flag first, otherwise the cache is
+  // never filled and every evaluation pays for parsing the properties again.
+  const bool no_properties_specified = properties.empty();
 
-  if (properties.empty()
+  if (no_properties_specified
       && OB_SUCC(setup_cache.get_default_properties(parser_name_, properties_))) {
     // fast path: canonical properties of "nothing specified" are known already
   } else if (OB_FAIL(parser_properties.init())) {
@@ -581,7 +585,7 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
                                                              ObCollationType::CS_TYPE_UTF8MB4_BIN,
                                                              true))) {
   } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
-  } else if (properties.empty()) {
+  } else if (no_properties_specified) {
     int tmp_ret = setup_cache.put_default_properties(parser_name_, properties_);
     if (OB_SUCCESS != tmp_ret) {
       LOG_DEBUG("failed to cache default parser properties", K(tmp_ret), K(parser_name_));
