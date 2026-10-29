@@ -889,3 +889,59 @@ hits 8001 / 11000 / 7332 / 20；`SUM(MATCH(...))` 仍是 `8707.764724`；token d
 
 `all_text_token_iters_` 只在**所有**维度都是该类型时置真，混合维度场景自动走原来的虚调用路径，
 所以这是一个纯粹的快路径，没有行为分叉风险。`dynamic_cast` 只在 `init()` 里执行。
+
+## 20. 第十一轮：收集器去虚化 —— 负结果（已回退）
+
+### 20.1 动机
+
+继 §19 把维度迭代器具体化之后，`collect_dims_by_id` 里还剩两个虚调用：每收集一个维度一次
+`relevance_collector_->collect_one_dim()`、每行一次 `relevance_collector_->get_result()`。
+它们的实现同样极小，而且 `ob_sparse_utils.cpp` 与 `ob_sparse_daat_iter.cpp` 也在同一个 unity TU：
+
+```cpp
+int ObSRDaaTInnerProductRelevanceCollector::collect_one_dim(const int64_t, const double relevance)
+{ total_relevance_ += relevance; matched_cnt_++; }
+int ObSRDaaTInnerProductRelevanceCollector::get_result(double &relevance, bool &is_valid)
+{ relevance = total_relevance_; is_valid = matched_cnt_ >= should_match_;
+  total_relevance_ = 0.0; matched_cnt_ = 0; }
+```
+
+做法是照抄 `push_merge_item()` 的写法，加两个内联帮助函数，用 `inner_product_collector_`
+（init 时 `dynamic_cast` 得到，非内积收集器时为 nullptr）走具体类型。
+
+### 20.2 结果：稳定变慢
+
+3 轮交错，每查询 400 次：
+
+| 轮次 | 新 (µs) | 旧 (µs) |
+| --- | --- | --- |
+| 1 | 1949 / 2496 / 1923 | 1946 / 2447 / 1878 |
+| 2 | 1962 / 2487 / 1919 | 1964 / 2456 / 1892 |
+| 3 | 1962 / 2620 / 1938 | 1979 / 2485 / 1903 |
+
+| 指标 | 均值 | 变化 |
+| --- | --- | --- |
+| query_cn | 1957.7 vs 1963.0 | −0.3%（噪声） |
+| query_beng | 2534.3 vs 2462.7 | **+2.9%**（3/3 轮变慢） |
+| query_mixed | 1926.7 vs 1891.0 | **+1.9%**（3/3 轮变慢） |
+
+原因推测：这两个函数体太短，内联省下的 5~6 条指令抵不过热循环里多出来的一次成员加载和一个分支；
+而原本的间接调用地址固定、预测命中率极高。**已用 `git checkout` 完整回退**，
+重新编译后二进制与 devirt8 **逐字节相同**（md5 `1c33a9f6f39ee159c4f22f67a5e62bf4`），
+说明回退是精确的。
+
+结论：去虚化的收益不是单调的，函数体小到一定程度时，多出来的分支与加载会吃掉全部收益。
+§19 之所以成功，是因为那两个访问器里有边界检查与取址，省下的不只是调用开销。
+
+### 20.3 副产物：一个容易误判的校验陷阱
+
+验证过程中发现 `SUM(MATCH(...))` 从 `8707.764724` 变成 `8708.539439`，一度以为改坏了语义。
+实测结论：
+
+- 同一个索引实例上，分数是完全确定的（连跑 5 次、逐行分数都一样）；
+- 但只要 `bench.sh` 重跑一次（已建索引会被重建），BM25 总量就会小幅变化，
+  因为打分依赖的是**本次索引实例**里的统计量；
+- 用旧二进制在新索引上重测，得到的同样是 `8708.539439`。
+
+所以：**逐行分数比的是「同一个索引实例」，跨索引实例只能比 hits 与 token dump。**
+以后做语义校验时，分数的对比必须在同一次索引构建之后、同一个服务进程内完成。
