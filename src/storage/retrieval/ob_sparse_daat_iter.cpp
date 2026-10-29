@@ -25,7 +25,7 @@ namespace storage
 
 ObSRMergeCmp::ObSRMergeCmp()
   : cmp_func_(nullptr),
-    iter_ids_(nullptr),
+    iter_ids_data_(nullptr),
     is_inited_(false)
 {
 }
@@ -38,7 +38,7 @@ int ObSRMergeCmp::init(
   if (OB_ISNULL(iter_ids)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    iter_ids_ = iter_ids;
+    iter_ids_data_ = iter_ids->get_data();
     common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(id_meta.type_, id_meta.cs_type_);
     cmp_func_ = basic_funcs->null_first_cmp_;
     if (OB_ISNULL(cmp_func_)) {
@@ -58,10 +58,15 @@ int ObSRMergeCmp::cmp(
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_ISNULL(iter_ids_data_)) {
+    ret = OB_ERR_UNEXPECTED;
   } else {
     int tmp_ret = 0;
+    // The dimension iterators keep their domain id datum at a stable address and the pointer array
+    // does not change after init(), so read the two datums straight from the raw array instead of
+    // going through a non inlined accessor twice per comparison.
     if (OB_FAIL(cmp_func_(
-            get_id_datum(l.iter_idx_), get_id_datum(r.iter_idx_), tmp_ret, nullptr))) {
+            *iter_ids_data_[l.iter_idx_], *iter_ids_data_[r.iter_idx_], tmp_ret, nullptr))) {
     } else {
       cmp_ret = tmp_ret;
     }
