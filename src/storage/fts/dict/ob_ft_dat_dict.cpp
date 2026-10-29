@@ -252,41 +252,9 @@ int ObFTDATReader<DATA_TYPE>::get_word_code(const ObString &ft_char, ObFTWordCod
   int ret = OB_SUCCESS;
   ObFTSingleWord word;
   word.set_word(ft_char.ptr(), ft_char.length());
-  // Characters repeat heavily both inside one document and across documents, so
-  // remember the last answer per slot instead of hashing the same bytes again.
-  const int64_t key_len = ft_char.length();
-  const bool cacheable = key_len > 0 && key_len <= CHAR_CODE_MAX_KEY_LEN;
-  uint64_t key = 0;
-  CharCodeEntry *entry = nullptr;
-  if (cacheable) {
-    MEMCPY(&key, ft_char.ptr(), key_len);
-    entry = &char_code_cache_[char_code_slot(key, key_len)];
-    if (entry->len_ == key_len && entry->key_ == key) {
-      if (entry->found_) {
-        code = entry->code_;
-      } else {
-        ret = OB_ENTRY_NOT_EXIST;
-      }
-      entry = nullptr; // hit, nothing left to store
-    }
-  }
   // OB_ENTRY_NOT_EXIST is propagated on purpose: the caller decides whether a
   // missing word merely means "this hit is dead".
-  if (nullptr != entry) {
-    ret = dat_->get_map()->find(word, code);
-    if (OB_SUCC(ret)) {
-      entry->key_ = key;
-      entry->len_ = static_cast<int8_t>(key_len);
-      entry->found_ = 1;
-      entry->code_ = code;
-    } else if (OB_ENTRY_NOT_EXIST == ret) {
-      entry->key_ = key;
-      entry->len_ = static_cast<int8_t>(key_len);
-      entry->found_ = 0;
-      entry->code_ = 0;
-    } else {
-    }
-  }
+  ret = dat_->get_map()->find(word, code);
   return ret;
 }
 

@@ -167,33 +167,7 @@ template <typename DataType = void>
 class ObFTDATReader
 {
 public:
-  // Tokenizers resolve the code of the very same characters for every document,
-  // and the dictionary behind dat_ cannot change while this reader is alive, so
-  // the answer can be reused.  Direct mapped and explicit thread local member:
-  // entries are validated by the exact key bytes, and the cache dies with the
-  // reader, so a rebuilt dictionary can never be observed through a stale entry.
-  static const int64_t CHAR_CODE_CACHE_SIZE = 128;
-  static const int64_t CHAR_CODE_MAX_KEY_LEN = 8;
-  struct CharCodeEntry
-  {
-    uint64_t key_;
-    int32_t code_;
-    int8_t len_;
-    int8_t found_;
-  };
-
-  ObFTDATReader(ObFTDAT *dat) : dat_(dat)
-  {
-    MEMSET(char_code_cache_, 0, sizeof(char_code_cache_));
-  }
-
-  // Index of the entry a key may live in; also used by the tests.
-  static int64_t char_code_slot(const uint64_t key, const int64_t len)
-  {
-    uint64_t h = key ^ (static_cast<uint64_t>(len) * 0x9E3779B97F4A7C15ULL);
-    h *= 0x9E3779B97F4A7C15ULL;
-    return static_cast<int64_t>((h >> 40) & (CHAR_CODE_CACHE_SIZE - 1));
-  }
+  ObFTDATReader(ObFTDAT *dat) : dat_(dat) {}
 
   // Match single word with hit.
   int match_with_hit(const ObString &single_word,
@@ -212,7 +186,6 @@ public:
 
 private:
   ObFTDAT *dat_;
-  mutable CharCodeEntry char_code_cache_[CHAR_CODE_CACHE_SIZE];
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObFTDATReader);

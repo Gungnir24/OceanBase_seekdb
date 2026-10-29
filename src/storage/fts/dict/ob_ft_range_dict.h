@@ -41,26 +41,6 @@ public:
       : is_inited_(false), desc_(desc), range_alloc_(lib::ObMemAttr("Range Dict")),
         range_dicts_(&range_alloc_), range_container_(range_container)
   {
-    MEMSET(char_range_cache_, 0, sizeof(char_range_cache_));
-  }
-
-public:
-  // The range table is immutable once the dictionary is built, so the range a
-  // given leading character falls into can be memoized in the object itself.
-  static const int64_t CHAR_RANGE_CACHE_SIZE = 128;
-  static const int64_t CHAR_RANGE_MAX_KEY_LEN = 8;
-  struct CharRangeEntry
-  {
-    uint64_t key_;
-    ObIFTDict *dict_;
-    int8_t len_;
-    int8_t found_;
-  };
-  static int64_t char_range_slot(const uint64_t key, const int64_t len)
-  {
-    uint64_t h = key ^ (static_cast<uint64_t>(len) * 0x9E3779B97F4A7C15ULL);
-    h *= 0x9E3779B97F4A7C15ULL;
-    return static_cast<int64_t>((h >> 40) & (CHAR_RANGE_CACHE_SIZE - 1));
   }
   ~ObFTRangeDict() override{};
 
@@ -126,7 +106,6 @@ private:
   ObArenaAllocator range_alloc_;
   ObVector<ObFTRange, ObArenaAllocator> range_dicts_;
   ObFTCacheRangeContainer *range_container_; // only used to read cache
-  mutable CharRangeEntry char_range_cache_[CHAR_RANGE_CACHE_SIZE];
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObFTRangeDict);
