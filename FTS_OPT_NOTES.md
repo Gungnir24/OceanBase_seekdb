@@ -1003,3 +1003,45 @@ tokenize_ik 最多提升 4% 左右，折合 33.3 × 0.04 ≈ **1.3 分**（beng 
 `ObIKCJKProcessor::do_process` 里已有的「同一字符的 code 每个字典只解析一次」优化仍然在
 （`code_dict` / `code_valid` 那段），也就是说 `get_word_code` 现在已经是**每字符每字典一次**，
 没有重复调用可省。
+
+## 22. 第十三轮：tokenize 的真正大头是 JSON 结果构造（inclusive 量化）
+
+对同一份 tokenize 语句采样做 inclusive 归因（`perf report --children -g graph`）：
+
+| 层级 | 占比 | 符号 |
+| --- | --- | --- |
+| 主调用 | **28.57%** | `ObExprTokenize::tokenize_fulltext(...)` |
+| 其上层 | 2.66% | `ObJsonExprHelper::pack_json_res` |
+| 其上层 | 2.29% | `ObJsonWrapper::get_raw_binary` |
+| 其上层 | 2.26% | `ObIJsonBase::get_raw_binary` |
+| 其上层 | 2.15% | `ObJsonBaseFactory::transform` |
+| 其上层 | 1.99% | `ObJsonBin::parse_tree` |
+| 其上层 | 1.73% | `ObJsonBinSerializer::serialize` |
+| 其上层 | 1.69% | `ObJsonBinSerializer::serialize_json_value` |
+
+拼起来看：**分词本身 + JSON 树构造约 28.6%，之后把树序列化成二进制 JSON 结果集还有约 10~12%**。
+两者合计接近 40%，远超 §21 里整个字典层的 10%。
+
+这修正了 §21 的推论：tokenize 的剩余空间确实在「JSON 输出」这条链上，
+而不是在字典查找或 trie 走查上。
+
+### 22.1 为什么早先的「二进制 JSON 直出」没收益
+
+在此之前有一次尝试记录为「手写二进制 JSON 无收益」，当时的做法是在 `tokenize_fulltext`
+之后**再造一份二进制**（相当于把序列化做了两遍），自然不可能变快。
+
+### 22.2 下一轮的具体方案（有据可依）
+
+链路上的浪费点很明确：`tokenize_fulltext` 先构造 `ObJsonNode` 树，
+`ObJsonBaseFactory::transform` 再把它转成 `ObJsonBin`，`parse_tree` 又解析一遍，
+最后 `ObJsonBinSerializer` 序列化。**如果 `tokenize_fulltext` 直接产出行协议需要的
+二进制 JSON（`ObJsonBin` 的 header + array of strings），可以省掉 transform + parse_tree
+两次转换**，预期能拿到这条链 30~50% 的时间，即 tokenize 整体的 4~6%。
+
+前提：必须逐字节对齐现网输出——官方 token dump 正好提供了这个校验手段
+（`lines=80018 md5=d620a35c914c3b1c7c15ca36337a7208`）。
+
+### 22.3 本轮状态
+
+本轮只做量化，未改代码：`fts-final` 保持 `da0ede713` 之后的文档提交，
+代码仍是 devirt8（官方全流程无崩溃）。
