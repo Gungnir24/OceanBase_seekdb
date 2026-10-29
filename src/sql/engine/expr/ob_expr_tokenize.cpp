@@ -39,6 +39,179 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+/**
+ * TOKENIZE() -- and every fulltext index build -- has to turn the parser name
+ * and the parser properties into a fully parsed ObFTParseHelper before any text
+ * can be segmented.  Both inputs are short immutable strings and the whole
+ * parsing (JSON document build, validation, parser description lookup) is a
+ * pure function of them, but it was being redone on every single call.
+ *
+ * This per-thread cache keeps the result of that work around: the canonical
+ * properties of a parser, the normalized ("inner") parser name and the parsed
+ * helper state.  Everything cached here is immutable, so no lock is needed and
+ * callers may keep using the returned strings.
+ */
+class ObTokenizeSetupCache
+{
+public:
+  static const int64_t MAX_NAME_LEN = 64;
+  static const int64_t MAX_PROPS_LEN = 1024;
+  static const int64_t MAX_DEFAULT_PROPS_CNT = 8;
+
+  static ObTokenizeSetupCache &get_instance()
+  {
+    static thread_local ObTokenizeSetupCache instance;
+    return instance;
+  }
+
+  // Canonical properties of "no properties were specified" for a parser.
+  int get_default_properties(const common::ObString &parser_name,
+                             common::ObString &properties)
+  {
+    int ret = OB_ENTRY_NOT_EXIST;
+    for (int64_t i = 0; i < default_props_cnt_ && OB_ENTRY_NOT_EXIST == ret; ++i) {
+      if (same_string(default_props_[i].name_, default_props_[i].name_len_, parser_name)) {
+        properties.assign_ptr(default_props_[i].props_, default_props_[i].props_len_);
+        ret = OB_SUCCESS;
+      }
+    }
+    return ret;
+  }
+
+  int put_default_properties(const common::ObString &parser_name,
+                             const common::ObString &properties)
+  {
+    int ret = OB_SUCCESS;
+    bool found = false;
+    for (int64_t i = 0; !found && i < default_props_cnt_; ++i) {
+      found = same_string(default_props_[i].name_, default_props_[i].name_len_, parser_name);
+    }
+    if (found) {
+      // already cached
+    } else if (default_props_cnt_ >= MAX_DEFAULT_PROPS_CNT
+               || parser_name.length() > MAX_NAME_LEN
+               || properties.length() > MAX_PROPS_LEN) {
+      ret = OB_SIZE_OVERFLOW;
+    } else {
+      DefaultPropsEntry &entry = default_props_[default_props_cnt_];
+      entry.name_len_ = static_cast<int32_t>(parser_name.length());
+      if (entry.name_len_ > 0) {
+        MEMCPY(entry.name_, parser_name.ptr(), entry.name_len_);
+      }
+      entry.props_len_ = static_cast<int32_t>(properties.length());
+      if (entry.props_len_ > 0) {
+        MEMCPY(entry.props_, properties.ptr(), entry.props_len_);
+      }
+      ++default_props_cnt_;
+    }
+    return ret;
+  }
+
+  // Parser name as given by the user -> normalized parser name with version.
+  int get_inner_parser_name(const common::ObString &raw_name, common::ObString &inner_name)
+  {
+    int ret = OB_ENTRY_NOT_EXIST;
+    if (inner_valid_ && same_string(inner_raw_, inner_raw_len_, raw_name)) {
+      inner_name.assign_ptr(inner_name_, inner_name_len_);
+      ret = OB_SUCCESS;
+    }
+    return ret;
+  }
+
+  int put_inner_parser_name(const common::ObString &raw_name, const common::ObString &inner_name)
+  {
+    int ret = OB_SUCCESS;
+    if (raw_name.length() > MAX_NAME_LEN || inner_name.length() > MAX_NAME_LEN) {
+      ret = OB_SIZE_OVERFLOW;
+    } else {
+      inner_raw_len_ = static_cast<int32_t>(raw_name.length());
+      MEMCPY(inner_raw_, raw_name.ptr(), inner_raw_len_);
+      inner_name_len_ = static_cast<int32_t>(inner_name.length());
+      MEMCPY(inner_name_, inner_name.ptr(), inner_name_len_);
+      inner_valid_ = true;
+    }
+    return ret;
+  }
+
+  // Fully parsed helper state for (parser name, properties).
+  int get_helper(const common::ObString &parser_name,
+                 const common::ObString &properties,
+                 common::ObIAllocator *allocator,
+                 storage::ObFTParseHelper &helper)
+  {
+    int ret = OB_ENTRY_NOT_EXIST;
+    if (helper_valid_
+        && same_string(helper_name_, helper_name_len_, parser_name)
+        && same_string(helper_props_, helper_props_len_, properties)) {
+      ret = helper.init_with_cached_state(allocator, helper_template_);
+    }
+    return ret;
+  }
+
+  int put_helper(const common::ObString &parser_name,
+                 const common::ObString &properties,
+                 const storage::ObFTParseHelper &helper)
+  {
+    int ret = OB_SUCCESS;
+    if (parser_name.length() > MAX_NAME_LEN || properties.length() > MAX_PROPS_LEN) {
+      ret = OB_SIZE_OVERFLOW;
+    } else {
+      helper_template_.reset();
+      if (OB_FAIL(helper_template_.init_with_cached_state(nullptr, helper))) {
+        helper_valid_ = false;
+      } else {
+        helper_name_len_ = static_cast<int32_t>(parser_name.length());
+        MEMCPY(helper_name_, parser_name.ptr(), helper_name_len_);
+        helper_props_len_ = static_cast<int32_t>(properties.length());
+        MEMCPY(helper_props_, properties.ptr(), helper_props_len_);
+        helper_valid_ = true;
+      }
+    }
+    return ret;
+  }
+
+private:
+  struct DefaultPropsEntry
+  {
+    char name_[MAX_NAME_LEN];
+    int32_t name_len_;
+    char props_[MAX_PROPS_LEN];
+    int32_t props_len_;
+  };
+
+  static bool same_string(const char *buf, const int32_t len, const common::ObString &str)
+  {
+    return len == str.length() && (0 == len || 0 == MEMCMP(buf, str.ptr(), len));
+  }
+
+  ObTokenizeSetupCache()
+      : inner_raw_(), inner_raw_len_(0), inner_name_(), inner_name_len_(0), inner_valid_(false),
+        default_props_(), default_props_cnt_(0), helper_template_(), helper_name_(),
+        helper_name_len_(0), helper_props_(), helper_props_len_(0), helper_valid_(false)
+  {
+  }
+  DISALLOW_COPY_AND_ASSIGN(ObTokenizeSetupCache);
+
+  char inner_raw_[MAX_NAME_LEN];
+  int32_t inner_raw_len_;
+  char inner_name_[MAX_NAME_LEN];
+  int32_t inner_name_len_;
+  bool inner_valid_;
+
+  DefaultPropsEntry default_props_[MAX_DEFAULT_PROPS_CNT];
+  int64_t default_props_cnt_;
+
+  storage::ObFTParseHelper helper_template_;
+  char helper_name_[MAX_NAME_LEN];
+  int32_t helper_name_len_;
+  char helper_props_[MAX_PROPS_LEN];
+  int32_t helper_props_len_;
+  bool helper_valid_;
+};
+} // namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -87,10 +260,23 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
   storage::ObFTWordMap token_map;
 
   ObArenaAllocator tmp_parse_alloc(ObMemAttr("Tmp buffer"));
+  ObTokenizeSetupCache &setup_cache = ObTokenizeSetupCache::get_instance();
 
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (OB_SUCCESS
+             == setup_cache.get_helper(param.parser_name_, param.properties_, &allocator, tokenize_helper)) {
+    // the (parser name, properties) pair was parsed before, nothing to do
   } else if (OB_FAIL(tokenize_helper.init(&allocator, param.parser_name_, param.properties_))) {
+  } else {
+    // best effort: on failure the helper is simply parsed again next time
+    int tmp_ret = setup_cache.put_helper(param.parser_name_, param.properties_, tokenize_helper);
+    if (OB_SUCCESS != tmp_ret) {
+      LOG_DEBUG("failed to cache parsed fulltext parser", K(tmp_ret), K(param.parser_name_));
+    }
+  }
+
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
   } else if (
       (0 != param.fulltext_.length())
@@ -222,15 +408,22 @@ int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, To
 {
   int ret = OB_SUCCESS;
   storage::ObFTParser parser;
+  ObTokenizeSetupCache &setup_cache = ObTokenizeSetupCache::get_instance();
 
   char *parser_name_buf = nullptr;
-  if (OB_ISNULL(parser_name_buf
+  if (OB_SUCC(setup_cache.get_inner_parser_name(input_str, param.parser_name_))) {
+    // the parser name was normalized before, reuse the result
+  } else if (OB_ISNULL(parser_name_buf
                 = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_FAIL(parser.init(input_str))) {
   } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
   } else {
     param.parser_name_ = ObString::make_string(parser_name_buf);
+    int tmp_ret = setup_cache.put_inner_parser_name(input_str, param.parser_name_);
+    if (OB_SUCCESS != tmp_ret) {
+      LOG_DEBUG("failed to cache normalized parser name", K(tmp_ret), K(input_str));
+    }
   }
   return ret;
 }
@@ -376,14 +569,23 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
 {
   int ret = OB_SUCCESS;
   storage::ObFTParserJsonProps parser_properties;
+  ObTokenizeSetupCache &setup_cache = ObTokenizeSetupCache::get_instance();
 
-  if (OB_FAIL(parser_properties.init())) {
+  if (properties.empty()
+      && OB_SUCC(setup_cache.get_default_properties(parser_name_, properties_))) {
+    // fast path: canonical properties of "nothing specified" are known already
+  } else if (OB_FAIL(parser_properties.init())) {
   } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
   } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
                                                              ObCollationType::CS_TYPE_UTF8MB4_BIN,
                                                              true))) {
   } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+  } else if (properties.empty()) {
+    int tmp_ret = setup_cache.put_default_properties(parser_name_, properties_);
+    if (OB_SUCCESS != tmp_ret) {
+      LOG_DEBUG("failed to cache default parser properties", K(tmp_ret), K(parser_name_));
+    }
   }
 
   return ret;

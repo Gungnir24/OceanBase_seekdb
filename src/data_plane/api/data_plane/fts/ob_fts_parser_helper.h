@@ -204,6 +204,19 @@ public:
 
   void reset();
 
+  /**
+   * Initialize from an already parsed helper.
+   *
+   * Parsing the parser name and its properties (which involves building and
+   * validating a JSON document) only depends on the two strings passed to
+   * init(), so hot paths may cache a parsed helper and reuse its state for
+   * every subsequent call, only rebinding the allocator that is used to hold
+   * the tokens of the current query.
+   *
+   * `allocator` may be NULL when the cached helper is only kept as a template.
+   */
+  int init_with_cached_state(common::ObIAllocator *allocator, const ObFTParseHelper &cached);
+
   TO_STRING_KV(KP_(allocator), K_(parser_name), KP_(parser_desc), K_(is_inited));
 
 private:

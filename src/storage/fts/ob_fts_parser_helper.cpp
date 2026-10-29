@@ -358,6 +358,27 @@ void ObFTParseHelper::reset()
   is_inited_ = false;
 }
 
+int ObFTParseHelper::init_with_cached_state(common::ObIAllocator *allocator,
+                                            const ObFTParseHelper &cached)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(is_inited_)) {
+    ret = OB_INIT_TWICE;
+  } else if (OB_UNLIKELY(!cached.is_inited_)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    // everything below only depends on the parser name / properties, which the
+    // cache guarantees to be the same, so no re-parsing is needed.
+    allocator_ = allocator;
+    parser_desc_ = cached.parser_desc_;
+    parser_name_ = cached.parser_name_;
+    add_word_flag_ = cached.add_word_flag_;
+    parser_property_ = cached.parser_property_;
+    is_inited_ = true;
+  }
+  return ret;
+}
+
 int ObFTParseHelper::segment(
     const ObObjMeta &meta,
     const char *fulltext,
