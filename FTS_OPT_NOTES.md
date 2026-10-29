@@ -685,3 +685,58 @@ need_project = (0 != relevance);
 | query_cn / beng / mixed / limit | **1.8819 / 2.6527 / 2.1516 / 2.7819 ms** |
 
 与 §14.4（select1 0.1570）相比：cn −3.9%、beng −3.6%、limit −3.2%、mixed +2.5%。
+
+## 17. 本阶段版本总表与稳定性结论
+
+### 17.1 版本表（fts-final 分支，按提交顺序）
+
+| 版本 | 代码 commit | 内容 | 交错 A/B 结论 | 状态 |
+| --- | --- | --- | --- | --- |
+| 起点 | `11072b6c5` | 批量改造（含锁存移除） | — | 基线 |
+| devirt | `012df7bc4` | 合并堆去虚化（§11） | cn −2.0% / beng −1.5% / limit −2.1% | 采纳 |
+| devirt2 | `707c8d0a8` | 维度数组指针提到 init（§12） | cn −1.0% / beng −0.7% / mixed −0.4% | 采纳 |
+| devirt3 | `27bd888f3` | 比较器直接读裸数组（§13） | cn −4.0% / beng −2.8% / mixed −2.4% / limit −4.7% | 采纳 |
+| devirt4 | `8c29d7348` | 热循环固定数组改裸指针（§14） | beng −2.4% / limit −0.7% | 采纳 |
+| — | （已回退） | utf8mb4 ASCII 快路径（§15） | 零收益 | 回退 |
+| devirt6 | `fa79fbe71` | 去掉 filter_on_demand 冗余写（§16） | cn −1.2% / mixed −0.8% | 采纳 |
+
+代码 commit 之外另有若干只改 `FTS_OPT_NOTES.md` 的文档提交
+（`08105b7c3` `8ad6dd96c` `eea8a61c2` `f7129c046` `ef0f795bd` `3b4257fa6` `0dcc1cf7b`）。
+
+### 17.2 官方全流程记录（每次都是 SKIP_LOAD=0、SAMPLES=3、WARMUP=30）
+
+| 版本 | select1 | build_total | query cn / beng / mixed / limit |
+| --- | --- | --- | --- |
+| nolatch（起点） | 0.1534 | 9.066 | 2.1294 / 2.9520 / 2.3433 / 2.7575 |
+| devirt | 0.1613 | 8.966 | 2.0182 / 2.8806 / 2.2044 / 3.0279 |
+| devirt2 | 0.1541 | 9.193 | 2.0290 / 2.8275 / 2.1558 / 2.7872 |
+| devirt4 | 0.1570 | 9.265 | 1.9588 / 2.7516 / 2.0983 / 2.8724 |
+| devirt6 | 0.1527 | 9.156 | **1.8819 / 2.6527 / 2.1516 / 2.7819** |
+
+注意：`select1`（纯框架开销）在 0.1527~0.1613 之间波动，**机器状态不同，跨行不宜直接相减**；
+每次改动的效果以上表的交错 A/B 为准（同一轮内交替重启、同一数据目录）。
+
+### 17.3 稳定性
+
+`devirt6` 连续跑了 **3 次**完整官方流程（`devirt6-full`、`green-check-p3`、`green-check-p4`）：
+
+- 三次 hits 全部是 8001 / 11000 / 7332 / 20；
+- 三次 token dump 均为 `lines=80018 md5=d620a35c914c3b1c7c15ca36337a7208`；
+- 运行日志与 err 输出里没有 segmentation / signal / core dumped；
+- 查询指标三次一致（cn 1.868~1.900、beng 2.653~2.660、mixed 2.054~2.152、limit 2.782~2.845），
+  说明当前版本没有偶发退化。
+
+### 17.4 这个查询路径还剩什么
+
+按 flat profile 排序（devirt6）：
+
+| 占比 | 位置 | 能否动 |
+| --- | --- | --- |
+| 4.5% + 2.4% | `ObStringDiffDecoder::batch_decode` + 其 memmove | 存储格式绑定，不能动 |
+| 3.5% | `fill_merge_heap` | 已去虚化/裸数组，只剩堆操作本身 |
+| 3.3% | `ObExprBM25::eval_batch_bm25_relevance_expr` | 之前 norel 实验证明去掉它整体是 wash |
+| 2.9% | `collect_dims_by_id` | 只剩 `collect_one_dim` / `get_result` 两个虚调用 |
+| 2.3% | `ObSimpleRowsMerger::push` | 比较 + 插入排序本身 |
+| 2.3% | `project_results` | 每行一次 `set_datum_func_` 间接调用 |
+
+剩下的都是 1~2% 量级、且多数在存储解码与 SQL 框架里，**已经没有 5% 以上的单点**。
