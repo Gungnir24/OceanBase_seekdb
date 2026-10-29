@@ -399,7 +399,6 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
   ObExpr *filter_expr = iter_param_->filter_expr_;
   ObExpr *relevance_proj_expr = iter_param_->relevance_proj_expr_;
   ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
-  ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
 
   if (!iter_param_->need_filter()) {
     need_project = true;
@@ -407,15 +406,13 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
     if (OB_UNLIKELY(count >= eval_ctx->max_batch_size_)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (filter_is_bool_of_relevance_) {
-      // BOOL(relevance) is true exactly when the accumulated score is non zero,
-      // which is what the expression would compute for this row as well.
-      guard.set_batch_idx(count);
-      ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
-      relevance_proj_datum.set_double(relevance);
-      relevance_proj_expr->get_evaluated_flags(*eval_ctx).set(count);
-      relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+      // BOOL(relevance) is true exactly when the accumulated score is non zero, which is what the
+      // expression would compute for this row as well.  The projected relevance datum does not have
+      // to be written here: a surviving row gets it from project_results(), which streams the same
+      // score out of the buffer, and a filtered out row is never read by anyone.
       need_project = (0 != relevance);
     } else {
+      ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
       guard.set_batch_idx(count);
       ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
       relevance_proj_datum.set_double(relevance);
@@ -431,6 +428,7 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
   } else if (OB_UNLIKELY(0 != count)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
+    ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
     guard.set_batch_idx(0);
     ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
     relevance_proj_datum.set_double(relevance);

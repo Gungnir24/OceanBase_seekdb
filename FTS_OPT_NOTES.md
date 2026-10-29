@@ -626,3 +626,49 @@ if (*src < 0x80 && *dst < 0x80) {
 
 教训：**profile 的占比必须和改动真正作用的代码路径对齐**，否则优化的是别人的热点。
 本次改动代码已 `git checkout` 回退，容器重建后的二进制与 devirt4 **逐字节相同**。
+
+## 16. 第八轮：去掉 filter_on_demand 里的冗余 relevance 写入
+
+### 16.1 改动
+
+`ObSRDaaTIterImpl::filter_on_demand()` 在 `filter_is_bool_of_relevance_` 快路径里，过去每行都要：
+
+```cpp
+guard.set_batch_idx(count);
+ObDatum &d = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
+d.set_double(relevance);
+relevance_proj_expr->get_evaluated_flags(*eval_ctx).set(count);
+relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+need_project = (0 != relevance);
+```
+
+但这几步是多余的：
+
+- 该行**通过过滤**时，`project_results()` 会用缓冲区里的同一个分数把 datum 和 evaluated flag 重新写一遍；
+- 该行**被过滤掉**时，它不会进入输出（`count` 不前进），下一行还会复用同一个槽位，没有任何读取者。
+
+所以 BOOL 快路径只剩下 `need_project = (0 != relevance);`。同时把
+`ObEvalCtx::BatchInfoScopeGuard` 从函数开头移到真正需要它的两个分支里（BOOL 路径不再每行构造/析构它）。
+
+### 16.2 验证
+
+- hits 8001 / 11000 / 7332 / 20 不变；token dump md5 不受影响（未改分词）。
+- **新老二进制 SQL 级输出对比**（重点验证被删掉的写入确实没被读）：按相关度排序取 top20、
+  `SUM(MATCH(...))` 聚合（8301 行）、带 `LIMIT/OFFSET` 的子查询——两边**逐字节相同**，
+  包括 `SUM` 精确到小数点后 6 位（`8707.764724` / `15807.105813`）。
+
+交错 A/B（4 轮，每查询 400 次；第 4 轮新版 limit 采样缺失）：
+
+| 指标 | 新版均值 | 旧版均值 | 变化 |
+| --- | --- | --- | --- |
+| query_cn | 2075.3 µs | 2101.3 µs | **−1.2%**（3/4 轮更快） |
+| query_mixed | 2044.3 µs | 2061.5 µs | **−0.8%** |
+| query_beng | 2718.3 µs* | 2727.3 µs* | −0.3%（持平） |
+| query_limit | 2812.5 µs | 2818.5 µs | −0.2%（持平） |
+
+*剔除第 1 轮新版 beng 的 2901 µs 离群值。
+
+### 16.3 结论
+
+收益只有 1% 量级。说明这条路径每行省下的 6 次存储 + 2 次调用 + 一个 guard 构造，在 2 ms 的单次
+查询里就是 20~25 µs。改动是纯简化（语义等价已用输出对比证明），无回退风险，保留。
