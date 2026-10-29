@@ -1152,3 +1152,47 @@ SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(content) AGAINST(...) LIMI
 
 未改代码（只做了针对性的 profile 归因）。`fts-final` 仍停留在 `339ff468b`，代码为 devirt8，
 最近一次官方全流程 `green-p5` 无崩溃、hits 与 token dump 一致。
+
+## 26. 第十七轮：§25.2 的靶点经查证不成立（ICF 又骗了一次）
+
+上一轮我把 `ObIArrayWrap<ObHashSet<unsigned long, ...>>::at(long)` 的 3.45% 当成
+「框架侧每行一次未内联数组访问」，准备照 §13/§14/§19 的办法修掉。查调用树后发现不成立：
+
+```
+collect_dims_by_id                                  3.16%
+  └─ process_collected_row                          0.52%
+       └─ ObDomainIdCmp::compare                    2.72%
+            └─ ObDatumStrCmp<CS_TYPE_UTF8MB4_BIN>   2.01%
+                 └─ __memcmp_avx2_movbe             0.78%
+```
+
+`ObIArrayWrap<...>::at` 是被 **ICF 合并的共享符号**：`at()` 的实例化有成百上千个
+（`ObIArray<int>`、`ObIArray<double>`、`ObIArray<ObHashSet<...>*>`……），
+链接器把完全相同的代码折叠成一个地址，于是 flat profile 上这一个符号的 self 时间
+是**所有调用者的总和**。3.45% 里绝大多数并不来自哈希集合。
+
+这和本项目早期记录过的 ICF 陷阱（§2）是同一个坑，只是这次我隔了几轮又踩了一遍。
+
+### 26.1 `query_limit` 真正的开销结构
+
+| 占比 | 内容 | 性质 |
+| --- | --- | --- |
+| 约 5% | `ObDomainIdCmp::compare` → `ObDatumStrCmp<utf8mb4_bin>` → `memcmp` | 字符串主键比较，**固有** |
+| 约 4% | `batch_decode` + `memmove` | 存储解码，**固有** |
+| 约 4% | `push`（堆内比较） | 堆操作本身 |
+| 约 3.4% | BM25 求值 | 与另外三个查询共享 |
+
+也就是说：`query_limit` 慢，是因为它**必须投影并比较字符串主键**，
+而这部分开销是数据模型决定的，不是某处漏了内联。
+
+### 26.2 结论
+
+`query_limit` 在这个方向上没有再优化 3% 的空间，撤回 §25.2 的预期。
+真正还剩下的量级空间只有 §22.2 的 tokenize JSON 直出（tokenize 整体 4~6%）。
+
+**方法论修正**：以后凡是在 flat profile 里看到 `ObIArrayWrap<T>::at`、`ObDatumXxxCmp<T>::cmp`
+这类模板符号，一律先看调用树再决定，不能直接按 self 时间立项。
+
+### 26.3 本轮状态
+
+未改代码。`fts-final` 仍为 `6cbea179e`，代码 devirt8，最近一次官方全流程 `green-p5` 无崩溃。
