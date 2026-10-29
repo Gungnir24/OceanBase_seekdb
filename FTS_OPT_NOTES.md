@@ -672,3 +672,16 @@ need_project = (0 != relevance);
 
 收益只有 1% 量级。说明这条路径每行省下的 6 次存储 + 2 次调用 + 一个 guard 构造，在 2 ms 的单次
 查询里就是 20~25 µs。改动是纯简化（语义等价已用输出对比证明），无回退风险，保留。
+
+### 16.4 官方全流程（LABEL=devirt6-full，SKIP_LOAD=0，SAMPLES=3）
+
+无崩溃，hits 8001 / 11000 / 7332 / 20，token dump `lines=80018 md5=d620a35c914c3b1c7c15ca36337a7208`：
+
+| 指标 | 数值 |
+| --- | --- |
+| select1_avg_ms | 0.1527 |
+| build_ik_all / ik_content / beng_en | 4.172 / 3.243 / 1.735 s |
+| tokenize_ik / beng | 0.2570 / 0.1869 ms |
+| query_cn / beng / mixed / limit | **1.8819 / 2.6527 / 2.1516 / 2.7819 ms** |
+
+与 §14.4（select1 0.1570）相比：cn −3.9%、beng −3.6%、limit −3.2%、mixed +2.5%。
