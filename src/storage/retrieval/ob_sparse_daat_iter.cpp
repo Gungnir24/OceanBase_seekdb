@@ -82,6 +82,7 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     buffered_relevances_(),
     next_round_iter_idxes_(),
     next_round_cnt_(0),
+    filter_is_bool_of_relevance_(false),
     set_datum_func_(nullptr)
 {
 }
@@ -102,6 +103,17 @@ int ObSRDaaTIterImpl::init(
     iter_param_ = &iter_param;
     dim_iters_ = &dim_iters;
     relevance_collector_ = &relevance_collector;
+    // BOOL(relevance) can only answer "did this row match", so recognising the
+    // shape once here lets the per row filter skip the generic expression
+    // evaluation later.  Anything else keeps using the expression path.
+    filter_is_bool_of_relevance_ = false;
+    if (nullptr != iter_param_->filter_expr_
+        && nullptr != iter_param_->relevance_proj_expr_
+        && T_OP_BOOL == iter_param_->filter_expr_->type_
+        && 1 == iter_param_->filter_expr_->arg_cnt_
+        && iter_param_->filter_expr_->args_[0] == iter_param_->relevance_proj_expr_) {
+      filter_is_bool_of_relevance_ = true;
+    }
     const int64_t max_batch_size = OB_MAX(iter_param_->eval_ctx_->max_batch_size_, iter_param_->max_batch_size_);
     if (iter_param_->id_proj_expr_->datum_meta_.type_ == common::ObUInt64Type) {
       set_datum_func_ = ObISparseRetrievalMergeIter::set_datum_int;
@@ -366,6 +378,15 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
   } else if (eval_ctx->is_vectorized()) {
     if (OB_UNLIKELY(count >= eval_ctx->max_batch_size_)) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (filter_is_bool_of_relevance_) {
+      // BOOL(relevance) is true exactly when the accumulated score is non zero,
+      // which is what the expression would compute for this row as well.
+      guard.set_batch_idx(count);
+      ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
+      relevance_proj_datum.set_double(relevance);
+      relevance_proj_expr->get_evaluated_flags(*eval_ctx).set(count);
+      relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+      need_project = (0 != relevance);
     } else {
       guard.set_batch_idx(count);
       ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);

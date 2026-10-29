@@ -105,6 +105,9 @@ protected:
   ObFixedArray<double, ObIAllocator> buffered_relevances_;
   ObFixedArray<int64_t, ObIAllocator> next_round_iter_idxes_;
   int64_t next_round_cnt_;
+  // True when the pushed-down filter is exactly BOOL(relevance), i.e. the query
+  // only asks whether a row matched and never looks at the score itself.
+  bool filter_is_bool_of_relevance_;
   void (*set_datum_func_)(ObDatum &, const ObDocIdExt &);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);
