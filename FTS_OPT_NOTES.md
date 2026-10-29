@@ -1075,3 +1075,33 @@ tokenize_ik 最多提升 4% 左右，折合 33.3 × 0.04 ≈ **1.3 分**（beng 
 它需要改 `tokenize_fulltext` 的构造方式并逐字节对齐 `ObJsonBin` 布局，
 属于 SQL 层深水区，应在一个完整的、上下文充足的轮次里单独做，
 并用 `tokdump` 的 md5 作为硬约束。
+
+## 24. 第十五轮：提交前代码卫生审计
+
+对 `fts-final` 相对阶段起点（`11072b6c5~1`）的全部源码改动做检查：
+
+```
+ src/storage/fts/ik/ob_ik_arbitrator.h          |   4 +-
+ src/storage/retrieval/ob_sparse_daat_iter.cpp  | 183 +++++++++++++++--------
+ src/storage/retrieval/ob_sparse_daat_iter.h    |  38 ++++--
+ 3 files changed, 164 insertions(+), 61 deletions(-)
+```
+
+检查项与结果：
+
+| 检查项 | 结果 |
+| --- | --- |
+| 新增 `LOG_DEBUG` / `printf` / `TODO` / `FIXME` / `#if 0` | 0 处 |
+| 新增 `std::cerr` 或临时输出 | 0 处 |
+| 新增 `LOG_WARN` | 仅 2 处，都在 `fill_merge_heap` 的 `OB_ITER_END` 异常分支（两条循环各一份，属预期） |
+| 改动文件范围 | 仅热路径两个文件 + 早已存在的 arbitrator 改动，无意外触碰 |
+
+热路径改动全部集中在 `ObSRDaaTIterImpl` 与 `ObSRMergeCmp` 内部，
+没有改变任何对外语义、参数解析或存储格式。
+
+### 24.1 当前状态汇总（可提测）
+
+- 代码提交：`65076298d`（devirt8）
+- 文档提交：`29225bc50` `da0ede713` `b3bce6409` `715c75fd6` `fb6c35622` 及本提交
+- 最近两次官方全流程：`devirt8-full`、`green-p5`，均无崩溃、hits 与 token dump 一致
+- 累计查询提升（相对阶段起点）：cn −18.4%、beng −16.7%、mixed −18.4%
