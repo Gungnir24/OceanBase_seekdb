@@ -89,6 +89,10 @@ protected:
   virtual int cache_result(int64_t &count, const ObDatum &id_datum, const double relevance);
   virtual int project_results(const int64_t count);
   int init_merge_heap(const int64_t count);
+  // Recognises the common shape where every dimension is served by the text retrieval DaaT token
+  // iterator, so that fill_merge_heap() can call it through the concrete type and inline its two
+  // tiny accessors (the two files share a unity translation unit).
+  int check_all_text_token_iters(const ObIArray<ObISRDaaTDimIter *> &dim_iters);
   // The merge heap is accessed several times per output row.  When it is the simple merger (the
   // usual case: at most ObSRSimpleMerger::USE_SIMPLE_MERGER_MAX_TABLE_CNT dimensions) the concrete
   // pointer lets these devirtualize and inline; otherwise fall back to the interface.
@@ -114,6 +118,9 @@ protected:
   // in init() because they are read once per dimension per output row.
   ObISRDaaTDimIter **dim_iters_arr_;
   const double *dim_weights_arr_;
+  // Set when every dimension iterator is an ObTextRetrievalDaaTTokenIter, which lets
+  // fill_merge_heap() take the concrete path.
+  bool all_text_token_iters_;
   ObSRDaaTRelevanceCollector *relevance_collector_;
   ObFixedArray<const ObDatum *, ObIAllocator> iter_domain_ids_; // record every dim iter's output domain id, one (ObDatum *) for one dim iter
   ObFixedArray<ObDocIdExt, ObIAllocator> buffered_domain_ids_; // cache for output

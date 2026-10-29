@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_sparse_daat_iter.h"
+#include "storage/retrieval/ob_text_retrieval_token_iter.h"
 
 namespace oceanbase
 {
@@ -84,6 +85,7 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     simple_merge_heap_(nullptr),
     dim_iters_arr_(nullptr),
     dim_weights_arr_(nullptr),
+    all_text_token_iters_(false),
     relevance_collector_(nullptr),
     iter_domain_ids_(),
     buffered_domain_ids_(),
@@ -135,6 +137,7 @@ int ObSRDaaTIterImpl::init(
     } else if (FALSE_IT(dim_weights_arr_ = OB_NOT_NULL(iter_param_->dim_weights_)
                                            ? &iter_param_->dim_weights_->at(0)
                                            : nullptr)) {
+    } else if (OB_FAIL(check_all_text_token_iters(dim_iters))) {
     } else if (FALSE_IT(iter_domain_ids_.set_allocator(iter_allocator_))) {
     } else if (OB_FAIL(iter_domain_ids_.init(dim_iters.count()))) {
     } else if (OB_FAIL(iter_domain_ids_.prepare_allocate(dim_iters.count()))) {
@@ -174,6 +177,7 @@ void ObSRDaaTIterImpl::reset()
   simple_merge_heap_ = nullptr;
   dim_iters_arr_ = nullptr;
   dim_weights_arr_ = nullptr;
+  all_text_token_iters_ = false;
   if (OB_NOT_NULL(relevance_collector_)) {
     relevance_collector_->reset();
     relevance_collector_ = nullptr;
@@ -310,22 +314,46 @@ int ObSRDaaTIterImpl::fill_merge_heap()
   // polymorphic at(), so index their raw storage instead of paying it once per element.
   const int64_t *iter_idxes = next_round_iter_idxes_.get_data();
   const ObDatum **domain_ids = iter_domain_ids_.get_data();
-  for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
-    const int64_t iter_idx = iter_idxes[i];
-    ObISRDaaTDimIter *dim_iter = nullptr;
-    if (OB_ISNULL(dim_iter = dim_iters_arr[iter_idx])) {
-      ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(dim_iter->get_next_row())) {
-      if (OB_UNLIKELY(OB_ITER_END != ret)) {
-        LOG_WARN("fail to try load next batch dimension data", K(ret));\
-      } else {
-        ret = OB_SUCCESS;
+  if (all_text_token_iters_) {
+    // Every dimension is a text retrieval DaaT token iterator: taking the concrete type here lets
+    // get_curr_score() and get_curr_id(), two member reads each, inline instead of costing two
+    // indirect calls per dimension per output row.
+    for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
+      const int64_t iter_idx = iter_idxes[i];
+      ObTextRetrievalDaaTTokenIter *dim_iter = nullptr;
+      if (OB_ISNULL(dim_iter = static_cast<ObTextRetrievalDaaTTokenIter *>(dim_iters_arr[iter_idx]))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(dim_iter->get_next_row())) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+          LOG_WARN("fail to try load next batch dimension data", K(ret));
+        } else {
+          ret = OB_SUCCESS;
+        }
+      } else if (OB_FAIL(dim_iter->get_curr_score(item.relevance_))) {
+      } else if (OB_NOT_NULL(dim_weights_arr) && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * dim_weights_arr[iter_idx])) {
+      } else if (OB_FAIL(dim_iter->get_curr_id(domain_ids[iter_idx]))) {
+      } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
+      } else if (OB_FAIL(push_merge_item(item))) {
       }
-    } else if (OB_FAIL(dim_iter->get_curr_score(item.relevance_))) {
-    } else if (OB_NOT_NULL(dim_weights_arr) && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * dim_weights_arr[iter_idx])) {
-    } else if (OB_FAIL(dim_iter->get_curr_id(domain_ids[iter_idx]))) {
-    } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
-    } else if (OB_FAIL(push_merge_item(item))) {
+    }
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < next_round_cnt_; ++i) {
+      const int64_t iter_idx = iter_idxes[i];
+      ObISRDaaTDimIter *dim_iter = nullptr;
+      if (OB_ISNULL(dim_iter = dim_iters_arr[iter_idx])) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(dim_iter->get_next_row())) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+          LOG_WARN("fail to try load next batch dimension data", K(ret));
+        } else {
+          ret = OB_SUCCESS;
+        }
+      } else if (OB_FAIL(dim_iter->get_curr_score(item.relevance_))) {
+      } else if (OB_NOT_NULL(dim_weights_arr) && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * dim_weights_arr[iter_idx])) {
+      } else if (OB_FAIL(dim_iter->get_curr_id(domain_ids[iter_idx]))) {
+      } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
+      } else if (OB_FAIL(push_merge_item(item))) {
+      }
     }
   }
 
@@ -508,6 +536,19 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
     ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
     relevance_proj_datum.set_double(buffered_relevances_.get_data()[0]);
     relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::check_all_text_token_iters(const ObIArray<ObISRDaaTDimIter *> &dim_iters)
+{
+  int ret = OB_SUCCESS;
+  all_text_token_iters_ = (dim_iters.count() > 0);
+  for (int64_t i = 0; all_text_token_iters_ && i < dim_iters.count(); ++i) {
+    ObISRDaaTDimIter *dim_iter = dim_iters.at(i);
+    if (OB_ISNULL(dim_iter) || OB_ISNULL(dynamic_cast<ObTextRetrievalDaaTTokenIter *>(dim_iter))) {
+      all_text_token_iters_ = false;
+    }
   }
   return ret;
 }
