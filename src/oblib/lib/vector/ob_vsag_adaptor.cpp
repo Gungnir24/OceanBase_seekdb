@@ -202,9 +202,21 @@ private:
 // Buffer vectors arriving via add_index. Plain HNSW builds BOTH its delta and its
 // snapshot incrementally via add_index (one row at a time), so this is where the
 // real data flows -- unlike build_index which is only used by the HNSW_SQ bulk path.
+// Buffering every row costs host memory (dim * 4 bytes per row) and only pays off
+// when the GPU is going to serve this index, so keep it behind the same switches
+// that turn the GPU path on. With both off the CPU index answers and the buffer
+// would never be read.
+static bool ob_cuvs_gpu_path_wanted() {
+  const char *gpu_only = ::getenv("SEEKDB_CUVS_GPU_ONLY");
+  const char *adopt = ::getenv("SEEKDB_CUVS_ADOPT");
+  return (gpu_only != nullptr && gpu_only[0] == '1')
+      || (adopt != nullptr && adopt[0] == '1');
+}
+
 static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
                         int dim, int size) {
   if (vectors == nullptr || ids == nullptr || dim <= 0 || size <= 0) { return; }
+  if (!ob_cuvs_gpu_path_wanted()) { return; }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
   if (slot == nullptr) { slot = new ObCuvsEntry(); slot->dim_ = dim; }

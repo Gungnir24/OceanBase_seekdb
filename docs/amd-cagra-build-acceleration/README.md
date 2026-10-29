@@ -305,3 +305,48 @@ VSAG 直接 `fdeserialize error(type=12)`，整条查询链 retry 71 次后失�
 
 根因是 lib 在 DDL 早期的 param 里还没落到 `VIAL_CUVS`。这个方向要做得干净得改
 参数传递链路，收益只是"少设一个环境变量"，所以回退，改为让复现脚本自带默认值。
+## 5. 提交自检
+
+### 5.1 af45720c 失败的原因
+
+提交号 `af45720c` 是中间状态，有一个必然导致建索引失败的 bug：
+
+```cpp
+// af45720c: ob_vsag_adaptor.cpp build_index()
+if (OB_FAIL(hnsw->build_index(dataset))) {
+} else if (ob_cuvs_marked(index_handler)) {
+  ob_cuvs_register(index_handler, vector_list, ids, dim, size);   // <-- 在 DDL 线程内建 CAGRA
+}
+```
+
+`ob_cuvs_register` 会当场调用 `seekdb_cuvs_build()`。DDL worker 线程只有很小的栈，
+而 CAGRA 建图是深度递归的 kernel 启动路径，结果就是**建索引时线程栈溢出、observer 崩溃**。
+这条路径不受环境变量控制（`lib=cuvs` 索引一建就会走），所以只要测试用例用 `lib=cuvs` 建索引就必挂。
+
+修复在 `e104856`：`build_index` 只把行缓冲起来（`ob_cuvs_add`），真正建 CAGRA 放到
+32MB 栈的常驻 worker 上懒执行；同一个提交还一并修了 bridge 的 `itopk` 参数 bug
+（`topk=100` 时 `topk must be smaller than itopk_size=64`，所有 LIMIT 100 的查询都失败）。
+
+### 5.2 当前版本的自检结果
+
+- 补丁对 baseline `08c76418` `git apply --check` 通过，应用后 14 个文件的 blob 与分支 HEAD 完全一致
+- 新增/改动的 C/C++ 片段用 gcc 13 `-Wall -Wextra` 单独编译通过（`ob_cuvs_gpu_path_wanted` / `ob_cuvs_add`）
+- 完整 observer 在 AMD 机器上构建通过并实测：20k `build=5.90s` 召回 1.0；100k `build=7.0–10.2s` 召回 0.990/0.974
+
+### 5.3 提交前应该跑的三件事
+
+```bash
+# 1) 补丁能应用
+git apply --check seekdb-cagra-build.patch
+# 2) 无 GPU 也能构建（默认 OB_BUILD_CUVS=OFF）
+./build.sh release --make -j"$(nproc)"
+# 3) GPU 构建：先出 bridge 再建 observer
+tools/hipvs_bridge/build.sh /tmp/libseekdb_cuvs_bridge.so
+./build.sh release -DOB_BUILD_CUVS=ON -DCUVS_BRIDGE_LIB=/tmp/libseekdb_cuvs_bridge.so --make -j"$(nproc)"
+```
+
+### 5.4 GPU 通路是显式开关
+
+`SEEKDB_CUVS_GPU_ONLY=1` / `SEEKDB_CUVS_ADOPT=1` 不设时，本补丁的行为等于 baseline
+（只多了 DDL 攒批），并且不缓存向量、不占额外内存；设了才走 GPU 独占构建。
+`tools/bench/amd_cagra_bench.py` 拉起 observer 时默认把这两个开关打开。
