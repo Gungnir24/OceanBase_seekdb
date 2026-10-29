@@ -572,3 +572,57 @@ cn 在 6 轮里有 5 轮更快，方向一致。
 | query_cn / beng / mixed / limit | 1.9588 / 2.7516 / 2.0983 / 2.8724 ms |
 
 与 §12.4（select1 0.1541）相比：cn −3.5%、beng −2.7%、mixed −2.7%、limit +3.1%。
+
+## 15. 第七轮：utf8mb4_general_ci 的 ASCII 快路径（实测零收益，已回退）
+
+### 15.1 动机
+
+建索引 profile 里 `ObSortOpImpl::Compare::operator()` 占 18.9%，它最终走到
+`ob_strnncollsp_utf8mb4`：每比较一个字符就要两次 `ob_mb_wc_utf8mb4`（解码）+ 两次
+`ob_tosort_unicode`（取权重）。对纯 ASCII 文本来说解码完全是多余的——单字节 < 0x80 时解码器必然
+返回长度 1、码点就是字节值。
+
+### 15.2 改动（已回退）
+
+在 `src/oblib/lib/charset/ob_ctype_utf8.cc` 的比较循环开头加：
+
+```c
+if (*src < 0x80 && *dst < 0x80) {
+  if (*src == *dst) { src++; dst++; continue; }   // 相同字节，权重必然相同
+  src_wc = *src; dst_wc = *dst;
+  ob_tosort_unicode(uni_plane, &src_wc, cs->state);
+  ob_tosort_unicode(uni_plane, &dst_wc, cs->state);
+  if (src_wc != dst_wc) { return src_wc > dst_wc ? 1 : -1; }
+  src++; dst++; continue;                          // 大小写折叠后相等，继续比较
+}
+```
+
+注意中间那个 `if (src_wc != dst_wc)` 不能省：`'A'` 和 `'a'` 折叠后权重相等，必须继续往后比，
+否则 `'Ab'` 和 `'aC'` 的排序会错。
+
+### 15.3 等价性验证
+
+除 hits / token dump 外，额外做了**新老二进制的 SQL 级语义对比**（13 条大小写、尾空格、
+前缀、`ORDER BY`、`MIN/MAX`、`DISTINCT` 相关表达式），两边输出**逐字节相同**，包括
+`'Ant'` 排在 `'ant'` 之前这种「权重相等时保持原序」的行为。
+
+### 15.4 性能结果（新 devirt5 vs 旧 devirt4，各两次完整官方流程交替）
+
+| 指标 | devirt5 | devirt4 |
+| --- | --- | --- |
+| build_ik_all | 4.174 / 4.174 | 4.175 / 4.276 |
+| build_beng_en | 1.634 / 1.634 | 1.633 / 1.747 |
+| tokenize_ik | 0.2587 / 0.2525 | 0.2519 / 0.2639 |
+| query_cn | 1.9477 / 1.9196 | 1.9160 / 1.9267 |
+| query_beng | 2.6927 / 2.7219 | 2.7589 / 2.7079 |
+
+**零收益**：两个 build 指标的新版最好值与旧版最好值差 0.1% 以内，完全在噪声里。
+
+### 15.5 结论
+
+`build_beng_en`（纯英文，最该受益的指标）纹丝不动，说明**建索引的时间不在排序比较器上**，
+或者至少 beng 这个索引的数据量/比较次数远不足以让比较器成为瓶颈。§10.9 里 18.9% 的比较器占比
+是在 `build_ik_all`（CJK，几万行）上采的，而 CJK 字符走不到这条 ASCII 快路径——两者不重叠。
+
+教训：**profile 的占比必须和改动真正作用的代码路径对齐**，否则优化的是别人的热点。
+本次改动代码已 `git checkout` 回退，容器重建后的二进制与 devirt4 **逐字节相同**。
