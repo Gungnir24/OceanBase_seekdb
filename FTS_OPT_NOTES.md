@@ -558,3 +558,17 @@ cn 在 6 轮里有 5 轮更快，方向一致。
 
 三个改动（§13 的 `get_id_datum`、§14 的裸数组、§12 的 init 解析）本质上都是同一件事：
 **把每行都要付的「未内联小访问器」换成直接取值**。这是这个查询路径上性价比最高的一类改动。
+
+### 14.4 官方全流程（LABEL=devirt4-full，SKIP_LOAD=0，SAMPLES=3）
+
+无崩溃，hits 8001 / 11000 / 7332 / 20，token dump `lines=80018 md5=d620a35c914c3b1c7c15ca36337a7208`
+（与基线完全一致）：
+
+| 指标 | 数值 |
+| --- | --- |
+| select1_avg_ms | 0.1570 |
+| build_ik_all / ik_content / beng_en | 4.279 / 3.242 / 1.735 s |
+| tokenize_ik / beng | 0.2549 / 0.1933 ms |
+| query_cn / beng / mixed / limit | 1.9588 / 2.7516 / 2.0983 / 2.8724 ms |
+
+与 §12.4（select1 0.1541）相比：cn −3.5%、beng −2.7%、mixed −2.7%、limit +3.1%。
