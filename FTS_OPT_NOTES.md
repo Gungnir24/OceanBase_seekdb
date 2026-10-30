@@ -2230,3 +2230,24 @@ DDL 并行度 1~12 改变不了消费者个数**。
 所以下一轮靶点非常具体：找到索引构建计划里 insert/drain 侧的 task 个数在哪里被定成 1
 （它不是 `create_index_arg.parallelism_`，否则 d12 时会有 12 个消费者），
 再让 sort 的输出能按 key 区间被多个 PX worker 并行消费。
+
+### 43.2 切片号有两条来源（代码事实）
+
+`ob_px_sstable_insert_op.cpp:84-96`（`get_tablet_info_from_row`）：
+
+```cpp
+for (i < row.count()) if (row.at(i)->type_ == T_PSEUDO_DDL_SLICE_ID) {
+  tablet_slice_param->slice_id_ = expr_datum.get_int();   // ① DDL 从行上带下来的切片号
+  found_slice_expr = true;
+}
+if (!found_slice_expr) tablet_slice_param->slice_idx_ = ctx_.get_px_task_id();  // ② 退化成 task_id
+if (slice_idx_ >= ObTabletSliceParam::MAX_TABLET_SLICE_COUNT) ret = OB_ERR_UNEXPECTED;
+```
+
+消费侧的切片划分因此有两条路：**DDL 在行上带 `T_PSEUDO_DDL_SLICE_ID`（切分来自 `split_multi_ranges`），
+或者退化成「一个 PX task 一片」（`px_task_id`）**。
+dop 1~12 尾巴不变说明实际走的是①：切片号来自 DDL，而**消费任务数没有跟着并行度变**，
+一个 task 顺序处理多个 slice（`switch_slice_if_need` 逐片切换 writer），所以切几片都串行。
+下一轮确认三件事：①`T_PSEUDO_DDL_SLICE_ID` 的取值个数；②dist 是否把不同 slice 的行路由到不同 task；
+③`ObTabletSliceParam::MAX_TABLET_SLICE_COUNT` 是否是暗坑上限。
+grep 起点：`T_PSEUDO_DDL_SLICE_ID`、`MAX_TABLET_SLICE_COUNT`、`ob_slice_calc.cpp`。
