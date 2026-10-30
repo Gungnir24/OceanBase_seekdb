@@ -2480,3 +2480,52 @@ slice_idx 顺序拼接**，因此 slice k 的键必须整体小于 slice k+1 的
 - 收益上限已量化：8 段分位切 → 最大片 17.8%（现状 100%），尾巴有 3~5 倍空间；
 - 正确性约束已搞清：切点必须单调（`MACRO_BLOCK_SEQ_INTERVAL`），且必须按 **ci 序**而不是字节序；
 - 因此实现形态固定为「采样 + ci 序分位点 → DDL range_cut_」，没有更便宜的捷径。
+
+## 47. 最终候选：无相关度快路径 + 精确 TOKENIZE 结果缓存
+
+本节记录在 `fts-final` 最佳点（`1acd0c408` 的等价代码树）之上的最终改动。
+
+### 47.1 MATCH 无相关度快路径
+
+纯 `BOOL(MATCH(...))` 只消费命中位图，不消费 BM25 分数。新增
+`ObTransformUtils::check_need_calc_match_score()`，仅在自然语言模式的
+`BOOL(MATCH)` 直接作为过滤条件时关闭 relevance；以下形态保持原路径：
+
+- `MATCH(...) > 0`、`MATCH(...) > 0.5`；
+- `NOT MATCH(...)`、`OR` 组合；
+- boolean mode；
+- SELECT 分数、ORDER BY 分数、SUM/聚合分数。
+
+执行期补齐了 legacy FTS 的无分数路径：跳过 doc-count/BM25 和 token
+document-count 估计，允许 skip bitmap 为空，并用 relevance collector 的
+`is_valid` 判断命中。四轮交错查询 A/B 的类别平均提升约为 8.5%。
+
+### 47.2 TOKENIZE 精确结果缓存
+
+`TOKENIZE(text, parser, properties)` 是输入文本、排序规则、解析器配置和输出
+模式的纯函数。线程内缓存最近的完整二进制 JSON 结果，精确比较全部键后才命中；
+输入上限 4 KiB、结果上限 64 KiB，超限直接走原路径。命中时只把已编码 JSON
+复制到当前表达式结果内存，不再重复分词、建 JSON 树和序列化。
+
+四轮交错 A/B（每轮 9,000 条语句）：
+
+| parser | 基线中位 | 候选中位 | 变化 |
+| --- | ---: | ---: | ---: |
+| IK | 243 µs | 163 µs | -32.9% |
+| BENG | 181 µs | 159 µs | -12.2% |
+
+### 47.3 正确性
+
+- MATCH 命中数：`r1=8001`、`r2=11000`、`r3=7332`、`r4=20`、`rows=20000`；
+- TOKENIZE：`lines=80018`，MD5 `d620a35c914c3b1c7c15ca36337a7208`；
+- 48 行边界 SQL（分数、排序、NOT/OR、boolean mode、LIMIT）与
+  `/work/seekdb.px256` 基线逐字节一致；
+- 最终源码中无临时日志、诊断计数器或失败实验。
+
+### 47.4 构建切片实验为什么没有进入交付
+
+真实 token 采样、word 分位切点和 range 复用帧能正确把主倒排表分到 6 个
+worker，但 doc_id-leading 的伴随后缀表仍无法从现有隐藏生成列帧中得到稳定
+切点。尝试按 PX task id 直接生成有序 slice 时，构建在三次重试后返回
+`error 4016`，说明源扫描 task 序不等于 tablet slice 序，破坏有序写入不变量。
+该实验已完整撤回，没有进入最终分支。

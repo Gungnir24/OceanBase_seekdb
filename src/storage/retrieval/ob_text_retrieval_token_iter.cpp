@@ -203,7 +203,9 @@ int ObTextRetrievalTokenIter::get_next_row()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
+  } else if (need_calc_relevance()
+      && !token_doc_cnt_calculated_
+      && OB_FAIL(estimate_token_doc_cnt())) {
   } else if (OB_FAIL(query::das_scan_next_row(inv_idx_scan_iter_))) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
     }
@@ -242,7 +244,9 @@ int ObTextRetrievalTokenIter::get_next_batch(const int64_t capacity, int64_t &co
   count = 0;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
+  } else if (need_calc_relevance()
+      && !token_doc_cnt_calculated_
+      && OB_FAIL(estimate_token_doc_cnt())) {
   } else if (OB_FAIL(query::das_scan_next_rows(
                  inv_idx_scan_iter_, count, OB_MIN(max_batch_size_, capacity)))) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
@@ -504,6 +508,7 @@ int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
   } else if (OB_FAIL(relevance_expr_->eval_batch(*eval_ctx_, *token_iter_->get_skip(), count_))) {
   } else {
     cur_idx_ = 0;
+    const sql::ObBitVector *skip = token_iter_->get_skip();
     const ObDatumVector &relevance_datum = relevance_expr_->locate_expr_datumvector(*eval_ctx_);
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
     // Doc ids and relevances live in contiguous ObFixedArray instances: take the
@@ -512,7 +517,7 @@ int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
     double *relevance_arr = count_ > 0 ? &relevance_.at(0) : nullptr;
     ObDocIdExt *doc_id_arr = count_ > 0 ? &doc_id_.at(0) : nullptr;
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
-      if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
+      if (OB_LIKELY(NULL == skip || !skip->at(i))) {
         relevance_arr[i] = relevance_datum.at(i)->get_double();
         if (OB_FAIL(doc_id_arr[i].from_datum(*doc_id_datum.at(i)))) {
         }
@@ -529,10 +534,11 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
     ret = OB_INVALID_ARGUMENT;
   } else {
     cur_idx_ = 0;
+    const sql::ObBitVector *skip = token_iter_->get_skip();
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
     ObDocIdExt *doc_id_arr = count_ > 0 ? &doc_id_.at(0) : nullptr;
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
-      if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
+      if (OB_LIKELY(NULL == skip || !skip->at(i))) {
         if (OB_FAIL(doc_id_arr[i].from_datum(*doc_id_datum.at(i)))) {
         };
       }

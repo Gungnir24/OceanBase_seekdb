@@ -12818,24 +12818,6 @@ int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
   } else if (expr == match_expr) {
     need_calc = true;
     need_check_child = false;
-  } else if (expr->get_expr_type() == T_OP_GT || expr->get_expr_type() == T_OP_LT) {
-    ObRawExpr *gt_param = NULL;
-    ObRawExpr *lt_param = NULL;
-    bool is_param_zero = false;
-    if (expr->get_param_count() != 2 || OB_ISNULL(expr->get_param_expr(0)) || 
-        OB_ISNULL(expr->get_param_expr(1))) {
-      ret = OB_INVALID_ARGUMENT;
-    } else if (OB_FALSE_IT(gt_param = expr->get_expr_type() == T_OP_GT ? expr->get_param_expr(0) : 
-                                                                         expr->get_param_expr(1))) {
-    } else if (OB_FALSE_IT(lt_param = expr->get_expr_type() == T_OP_GT ? expr->get_param_expr(1) : 
-                                                                         expr->get_param_expr(0))) {
-    } else if (gt_param != match_expr) {
-      /* do nothing */
-    } else if (OB_FAIL(check_expr_eq_zero(exec_ctx, lt_param, is_param_zero, constraints))) {
-    } else if (is_param_zero) {
-      need_calc = false;
-      need_check_child = false;
-    }
   } else if (expr->get_expr_type() == T_OP_BOOL) {
     if (expr->get_param_count() == 1 && expr->get_param_expr(0) == match_expr) {
       need_calc = false;
@@ -12851,6 +12833,44 @@ int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
                                                               tmp_need_calc,
                                                               constraints)))) {
       } else if (tmp_need_calc) {
+        need_calc = true;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
+                                                  const ObDMLStmt *stmt,
+                                                  ObRawExpr *match_expr,
+                                                  bool &need_calc,
+                                                  ObIArray<ObExprConstraint> &constraints)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObRawExpr*, 32> relation_exprs;
+  need_calc = false;
+  UNUSED(exec_ctx);
+  UNUSED(constraints);
+  if (OB_ISNULL(exec_ctx) || OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_UNLIKELY(!match_expr->is_match_against_expr())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_UNLIKELY(ObMatchAgainstMode::NATURAL_LANGUAGE_MODE
+                         != static_cast<ObMatchFunRawExpr *>(match_expr)->get_mode_flag())) {
+    need_calc = true;
+  } else if (OB_FAIL(stmt->get_relation_exprs(relation_exprs))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < relation_exprs.count(); ++i) {
+      ObRawExpr *expr = relation_exprs.at(i);
+      if (OB_ISNULL(expr)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (!expr->is_match_against_expr() && !expr->has_flag(CNT_MATCH_EXPR)) {
+        // This expression does not reference the MATCH being planned.
+      } else if (T_OP_BOOL == expr->get_expr_type()
+                 && 1 == expr->get_param_count()
+                 && expr->get_param_expr(0) == match_expr) {
+        // A positive boolean MATCH only needs the engine's match bitmap.
+      } else {
         need_calc = true;
       }
     }

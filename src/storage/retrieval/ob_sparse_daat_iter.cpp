@@ -444,12 +444,13 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
       // expression would compute for this row as well.  The projected relevance datum does not have
       // to be written here: a surviving row gets it from project_results(), which streams the same
       // score out of the buffer, and a filtered out row is never read by anyone.
-      need_project = (0 != relevance);
+      // Without score calculation, validity comes from the relevance collector's match count.
+      need_project = !iter_param_->need_calc_relevance() || (0 != relevance);
     } else {
       ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
       guard.set_batch_idx(count);
       ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
-      relevance_proj_datum.set_double(relevance);
+      relevance_proj_datum.set_double(iter_param_->need_calc_relevance() ? relevance : 1.0);
       relevance_proj_expr->get_evaluated_flags(*eval_ctx).set(count);
       relevance_proj_expr->set_evaluated_projected(*eval_ctx);
       ObDatum *filter_res = nullptr;
@@ -465,7 +466,7 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
     ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
     guard.set_batch_idx(0);
     ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
-    relevance_proj_datum.set_double(relevance);
+    relevance_proj_datum.set_double(iter_param_->need_calc_relevance() ? relevance : 1.0);
     relevance_proj_expr->set_evaluated_projected(*eval_ctx);
   }
   return ret;
