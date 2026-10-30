@@ -1626,3 +1626,23 @@ FTS 索引的建立被硬编码只给三分之一的并行度。实测机器上�
 §33 那 −2.45% 的收益是真实的（本轮 par3 复测 3850 ms，与之前 3804~3974 一致，
 对比 devirt8 的 3871~4155），但**机制不是「增加了 worker 数」**——
 更可能是 `parallelism_` 在别处影响了任务切分粒度。
+
+### 33.7 真正的 DOP 来源（下一轮的起点）
+
+追查 `create_index_arg.parallelism_` 的消费方，结论是**它不进入 PX 计划的并行度计算**：
+
+- `ob_fts_index_build_task.cpp` 里 `parallelism_` 只被赋给 `create_index_arg_.parallelism_`（第 144 行），
+  之后 `ob_ddl_common_rs_impl.cpp:182` 又把它转成 `create_index_arg.parallelism_` 传给 DDL service；
+- 真正决定并行度的是优化器：**`src/sql/optimizer/ob_optimizer_util.cpp:8007` `params.parallelism_ = compute_parallel;`**
+- 该并行度随后进入 **`src/sql/engine/px/ob_granule_pump.cpp`**，用于
+  `taskset_array.prepare_allocate(args.parallelism_)`、`split_tasks_access_all(...)` 等切分逻辑。
+
+**所以下一轮应该看 `compute_parallel` 怎么算**，以及 `ObGranulePump` 最终切出多少个 task set。
+另外要确认 PX worker 池本身有没有上限：实测始终只有 5 个 `PX_G0` 线程在跑、并发度恒为 2.4，
+改 DOP 完全不动，这更像是 worker 池或 granule 数量被别的东西钉死了。
+
+排查顺序建议：
+1. `ObOptimizerUtil::compute_parallel`（8007 附近）的入参与返回值；
+2. `ObGranulePump` 的 `args.parallelism_` 与 `args.tablet_size_`（971 行有 `parallelism_<=0 || tablet_size_<=0` 的告警）——
+   非分区表单 tablet 会不会让 task set 只能切出 1~2 个；
+3. `ObPxPool` 的线程数上限。
