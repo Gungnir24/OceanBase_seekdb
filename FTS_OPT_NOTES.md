@@ -2480,3 +2480,46 @@ slice_idx 顺序拼接**，因此 slice k 的键必须整体小于 slice k+1 的
 - 收益上限已量化：8 段分位切 → 最大片 17.8%（现状 100%），尾巴有 3~5 倍空间；
 - 正确性约束已搞清：切点必须单调（`MACRO_BLOCK_SEQ_INTERVAL`），且必须按 **ci 序**而不是字节序；
 - 因此实现形态固定为「采样 + ci 序分位点 → DDL range_cut_」，没有更便宜的捷径。
+
+## 47. 仅需行数的全文派生表不再强制回表
+
+query_limit 的原始计划虽然已经把 `LIMIT 20` 下推到全文扫描，派生表投影仍保留
+`docs.id`，导致 `TEXT RETRIEVAL SCAN` 显示 `is_index_back=true`、`access([docs.id])`。
+但外层只做 `COUNT(*)` 时，派生表只贡献行数，任何投影值都不参与结果。
+
+根因在表达式分配阶段：扫描当时仍计划回表，因此 primary key 被加入 `rowkey_exprs_`；
+后序 `PROJECT_PRUNING` 删掉 `SubPlanScan` 的输出后，表扫描的 rowkey 访问仍会阻止
+`id` 被剪掉。
+
+修改位于 `ob_logical_operator.cpp::project_pruning_pre()`。在原有访问列和回表剪枝之后，
+仅当以下条件全部成立时，把全文扫描输出替换为常量并清空访问列：
+
+- 直接父算子是 `SUBPLAN_SCAN`，且父算子不再需要任何投影值；
+- 全文扫描只剩 rowkey 访问，且父算子过滤、扫描过滤、下推聚合、LIMIT/OFFSET
+  和排序表达式都不依赖该 rowkey；
+- 不涉及 function lookup、ES match、FTS index merge 或向量索引。
+
+修改后的计划为：
+
+```text
+TEXT RETRIEVAL SCAN
+  output([1])
+  access(nil)
+  is_index_back=false
+```
+
+验证结果：
+
+- 20 组 COUNT 边界 SQL 与 fts-final 基线逐字一致，覆盖 LIMIT/OFFSET、排序、
+  COUNT(column)、COUNT(DISTINCT)、SUM、外层过滤、DISTINCT、分组、窗口、
+  子查询和 UNION；
+- 正式命中数仍为 `8001 / 11000 / 7332 / 20`；
+- 完整 TOKENIZE 输出仍为 80,018 行，MD5
+  `d620a35c914c3b1c7c15ca36337a7208`；
+- 400 次查询 × 5 组、正反顺序交替 4 轮，query_limit 中位数从均值
+  2.7093 ms 降到 2.5306 ms，约减少 6.6%；
+- 同一环境完整基准中 query_limit 从 2.7426 ms 降到 2.6258 ms，其余指标在噪声范围内。
+
+尝试过但未采纳：在 pure scalar `COUNT(*)` 上直接设置
+`need_calc_relevance_=false`。计划可以生成，但执行时在存储初始化路径崩溃；
+说明当前后序资源准备仍依赖相关度分支，该方向需要更完整的计划阶段改造。
