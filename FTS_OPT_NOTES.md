@@ -1798,3 +1798,152 @@ C++ 侧只有读取方（`config::px_task_size()`）：
 
 256K 已经接近拐点，再往下切细只增加调度与合并开销，并行度也不再上升（3.27 vs 3.26）。
 **默认值保持 256K**，128K 的实验改动已用 `git checkout` 回退。
+
+## 36. 第三十轮：`px_task_size` 三臂正式对照（256K / 128K / 64K）—— 维持 256K
+
+### 36.1 实验方式：同一二进制 + 启动参数覆盖
+
+§35.6 是「两个不同二进制」的单轮对比，方向虽然是 128K 更慢，但只有一轮有效数据。
+本轮改成**同一个二进制跑三个臂**，把「编译差异」这个变量彻底去掉：
+
+| 臂 | 启动方式 |
+| --- | --- |
+| 256K | `--parameter px_task_size=256K`（覆盖回上一版默认值） |
+| 128K | 默认（该二进制编译进去的就是 128K） |
+| 64K | `--parameter px_task_size=64K` |
+
+`px_task_size` 是 `edit_level: DYNAMIC_EFFECTIVE`，可以这样覆盖，因此**不必为每一档付一次全量重编**
+（改 yaml 默认值会触发 rust 生成头变化 → C++ unity 对象全部重编，本次实测约 9 分钟）。
+脚本：`/work/abp2.sh`（重启 → 确认索引存在 → 3 次 `DROP INDEX`+`ADD FULLTEXT INDEX` 计时，
+同时记录 `par = cpu_time / wall_time`），驱动脚本 `/work/run-sweep.sh`。
+
+### 36.2 结果：三臂一致，无可验证收益
+
+每臂 9 次 `build_ik_content`（3 轮 × 3 次，轮内三臂交错）：
+
+| 臂 | 9 次测量（ms） | 均值 | 中位数 | par 范围 |
+| --- | --- | --- | --- | --- |
+| 256K | 2931 2882 2867 3151 3087 2972 2939 2763 3085 | 2964 | 2939 | 2.76 ~ 3.29 |
+| 128K | 2926 2879 3314 2935 2664 2668 3166 2784 2781 | 2902 | 2879 | 2.84 ~ 3.17 |
+| 64K | 3354 3001 3077 3559 2676 2679 2824 2677 2678 | 2947 | 2824 | 2.50 ~ 3.33 |
+
+- 均值：128K −2.1%、64K −0.6%；中位数：128K −2.0%、64K −3.9%；
+- 但**逐轮方向不一致**（第 1 轮 128K 反而慢 5%，第 2 轮快 10%，第 3 轮持平），
+  单轮内还有 3354 / 3559 这种离群值 —— 噪声带宽就是 ±10~15%；
+- **par 三档完全一样（3.0 ~ 3.3）**，这一条比时间更能说明问题：task 数已经不是限制。
+
+§35.6 的方向（128K 略慢）与本轮的均值方向（128K 略快）相反，幅度也都在噪声内，
+两个实验能共同支持的结论只有一个：**128K / 64K 都没有可验证的收益，维持 256K**。
+host 工作树的 `128K` 改动已 `git checkout` 回退，容器内源码同样同步回 256K，分支仍是 `5b2310ecc` 的行为。
+
+### 36.3 为什么过了 256K 就不再变化（机制闭合）
+
+`ObParallelRangeTaskPlanner::compute_total_task_count()` 里，
+`expected_task_load_kb` 取 `max(tablet_size/1024, px_task_size/1024)`，而 `tablet_size` 默认 **128M**。
+2 万行的表只有 ~6 MB，永远走第一分支：
+
+```
+task_cnt = min(min_task_count_per_thread(13) * parallelism,
+               total_size_kb / px_task_size_kb)
+```
+
+于是 2M → 2~3 个 task，256K → ~23 个，128K → ~47 个，64K → ~93 个。
+但实测 par 在 23 / 47 / 93 个 task 下都是 3.0~3.3，**说明 2~3 个 task 之后瓶颈就换人了**（见 §37）。
+这同时解释了 §35 的 −6.0%：那是「2 个 task → 23 个 task」这一跳，再往下没有第二跳。
+
+### 36.4 踩坑：计时型 A/B 必须验证「被测动作真的发生了」
+
+第一次跑 A/B 时出现 `build_ms: 8488 / 10472 / 22 / 10 / 9` 的假数据。原因：
+`/tmp/rebuild.sql` 第一条是 `DROP INDEX fti_content_ik`，一旦索引已经不在
+（上一轮 DDL 失败或会话被打断），mysql 在**第一条就退出**，`ADD` 根本没执行，
+计时只剩客户端启动的十几毫秒；8488 / 10472 那种巨值则是 DDL 队列里残留任务的恢复时间。
+
+新脚本加了两个保护：跑之前查 `information_schema.statistics`，没有索引就先补建；
+每轮结束再查一次索引是否真的存在，不存在就打印 `REP_FAILED` 并停止。
+
+## 37. 建索引并行度的第二层：worker 够了，是负载长尾（新证据）
+
+### 37.1 线程级采样（px256，一次 build，`top -H` 1 秒窗口）
+
+```
+239699 PX_G0  88.6%     239705 PX_G0  16.2%     239707 PX_G0  11.4%
+239679 PX_G0  80.0%     239717 PX_G0  15.2%     239716 PX_G0  11.4%
+239701 PX_G0  43.8%     239703 PX_G0  13.3%     239649 DDLTask+ 10.5%
+239700 PX_G0  41.9%     239718 PX_G0  13.3%     239696 PX_G0   9.5%
+239698 PX_G0  24.8%     239704 PX_G0  12.4%     239644 DDLTask+  8.6%
+239695 PX_G0  23.8%     239706 PX_G0  12.4%
+```
+
+窗口内 `%Cpu(s)`：`57.6 us, 3.3 sy, 35.9 id` → 约 **4.4 核**，与 par 3.0~3.3 吻合。
+
+### 37.2 解读：不再是「worker 不够」
+
+- 早期 §32.1 只看到 5 个 PX 线程，是因为那时 task 数只有 2~3；
+  现在仅 ≥8% CPU 的 `PX_G0` 就有 **15 个**，任务分片已经足够。
+- 但负载严重长尾：两个线程各 0.9 / 0.8 核，其余十三个只有 0.1~0.4 核。
+  inclusive 结构与之对应：`write_ordered_slice_by_row` 53%（其中拉子算子 35%）、
+  `ObPxDistTransmitOp::do_range_dist` 34% —— **汇总/写入侧的分片比扫描侧粗**。
+- 所以「调 px_task_size / 调 DOP」这条路已经走到头（§36.2 三臂实验 + §33.6 强制 DOP=8 都证实）。
+  要再快只能动写入侧的 slice 划分，属于 PX/DDL 框架改动，风险与本阶段预算不匹配。
+- **下一轮的第一个问题**：非分区表的 FTS 索引 tablet 只有一个，
+  `ObPxMultiPartSSTableInsertOp` 的写入是否只能落在一个 slice 上？若是，扫描侧再并行也只能等它。
+
+## 38. 查询侧重新 profile（px_task_size 不影响 query —— 因为 query 不用 PX）
+
+### 38.1 结论先行：担心不成立
+
+四个查询指标的计划里**没有 PX**，全部在 `ReqWorker`（请求线程）上单线程执行：
+1200 次混合查询的 perf 采样中 93.4% 落在 `ReqWorker`，`PX_G0` **一个样本都没有**。
+
+所以「px_task_size 也会影响 query 的 task 切分、之前 query 的结论可能过时」这个假设不成立：
+`px_task_size` 只影响 DDL/PX 计划的 task 切分，而这条查询路径根本不生成 PX 计划。
+§35.5 全量回归里 query 的 ±1.2% 不是巧合，是这条路径对参数不敏感。
+
+顺带验证「能不能给 query 开并行」：
+`SELECT /*+ PARALLEL(8) */ ...` 与 `/*+ PARALLEL(8) USE_PX */` 的 `EXPLAIN` 与无 hint **逐字相同**
+（hint 被忽略，计划仍是 `SCALAR GROUP BY → TEXT RETRIEVAL SCAN`）。
+连续 3 轮交替计时（每轮 400 条查询，扣掉 `SELECT 1` 基线）差异只有 0.1%~3%，
+所以连「并行是否更快」都无法从这条路上测出来 —— 想在 query 上要收益必须改优化器的计划选择，
+调参没有用。
+
+### 38.2 query 的 flat self（1200 次混合查询）
+
+| 占比 | 符号 |
+| --- | --- |
+| 6.53% | `ObStringDiffDecoder::batch_decode`（倒排宏块解码） |
+| 4.69% | `ObSimpleRowsMerger::...`（合并） |
+| 4.61% | `ObExprBM25::eval_batch_bm25_relevance` |
+| 4.60% | `__memmove_avx_unaligned_erms` |
+| 3.77% | `ObSRDaaTIterImpl::fill_merge_heap` |
+| 3.55% | `__memcmp_avx2_movbe` |
+| 3.43% | `ObDatumStrCmp<CS_TYPE_UTF8MB4_BIN>` |
+| 3.24% | `ObSRDaaTIterImpl::collect_distinct` |
+| 2.35% | `ObSRDaaTIterImpl::project_relevance` |
+| 1.70% | `ObIntegerBaseDiffDecoder::...` |
+
+inclusive：`ObTableScanOp::inner_get_next_batch_for_das` 86.3% → `ObDASMergeIter` 80.3%
+→ `ObSRDaaTIterImpl::get_next_rows` 50.9% / `do_one_merge_round` 49.9% / `fill_merge_heap` 41.7%。
+
+与 §31.2 的结论一致：**倒排解码 + 多路归并 + 去重**，没有因为 px_task_size 出现新热点。
+相关性那 7%（BM25 4.61% + project_relevance 2.35%）看着不小，但 §17 已实测剥离是持平，不再重复。
+
+### 38.3 本轮绿色确认（px256 = 已提交版本，skip_load=0 全新装载）
+
+| 项目 | 结果 |
+| --- | --- |
+| build_ik_all / content / beng | 3.478 / 2.563 / 1.441 s |
+| tokenize_ik / beng | 0.2642 / 0.1915 ms |
+| query cn / beng / mixed / limit | 1.8940 / 2.6430 / 2.0405 / 2.8346 ms |
+| hits | 8001 / 11000 / 7332 / 20 |
+| tokdump | 80018 行，`d620a35c914c3b1c7c15ca36337a7208` |
+
+### 38.4 本轮留下的脚本（可直接复用）
+
+| 脚本 | 用途 |
+| --- | --- |
+| `/work/restart-param.sh` | 重启并支持追加 `--parameter`（同二进制改参数实验的基础） |
+| `/work/abp2.sh` | 带「索引真的建出来了」校验的 build A/B，输出 ms + par |
+| `/work/run-sweep.sh` | 256K / 128K / 64K 三臂交错扫描 |
+| `/work/measure-threads.sh` | build 期间 `top -H` 线程级 CPU 采样 |
+| `/work/prof2.sh` | build 与 query 的 perf 采样（inclusive 与 flat 两种视图） |
+| `/work/pq.sh` / `/work/ex.sh` | 查询并行 hint 的计时与计划对比 |
