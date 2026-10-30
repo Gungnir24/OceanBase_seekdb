@@ -1772,3 +1772,19 @@ C++ 侧只有读取方（`config::px_task_size()`）：
 `px_task_size` 是全局参数，所有并行查询的 task 切分都会变细。
 本赛题是小表 + 8 核，有利；但**必须再跑一次完整官方流程**确认 query 三项与 tokenize 没有回退。
 本轮的两次 A/B 只覆盖了 build，尚未验证 query/tokenize。
+
+### 35.5 全量回归（官方流程，skip_load=1）
+
+`bash /work/bench.sh px256-final 1` → `report-px256-final-012001.txt`
+
+| 指标 | px256 | final-e98e23f（devirt8） | 结论 |
+| --- | --- | --- | --- |
+| select1 | 0.1508 ms | 0.1532 ms | 持平 |
+| tokenize_ik | 0.2476 ms | 0.2528 ms | 持平/略好 |
+| tokenize_beng | 0.1842 ms | 0.1924 ms | 持平/略好 |
+| query_cn | 1.7983 ms | 1.7771 ms | +1.2%（噪声内） |
+| query_beng | 2.4816 ms | 2.4602 ms | +0.9%（噪声内） |
+| hits | 8001 / 11000 / … | 一致 | 正确 |
+
+**结论：`px_task_size=256K` 没有让 query 与 tokenize 回退**，build 侧的 −6.0% 是净收益。
+（本次 skip_load=1 所以 build 字段为 N/A，build 数据取自 §35.3 的交错 A/B。）
