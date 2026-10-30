@@ -1681,3 +1681,48 @@ DOP 只是 `params.parallelism_` 的一个输入，真正的 task 数还受 `est
 
 注：上面追到的这个函数是 NLJ SPF 路径，FTS 建索引 DDL 是否走同一条函数**尚未确认**，
 下一轮必须先确认这一点，避免又出现「改错位置」的情况（§28.3 的教训）。
+
+## 34. 第二十八轮：`px_task_size` 是并行度真凶 —— 建索引 −20.3%
+
+### 34.1 决定性实验（纯参数，未改代码）
+
+`px_task_size` 默认 **2M**（`SHOW PARAMETERS LIKE '%task_size%'`）。
+把它调小后建索引时间大幅下降：
+
+| 启动参数 | build_ik_all（3 遍平均） | 实测并行度 |
+| --- | --- | --- |
+| 默认（2M） | 3985 ms | 2.45 |
+| `--parameter px_task_size=256K` | **3175 ms** | **3.24** |
+
+**−20.3%，并行度 2.45 → 3.24。** 这与 §33.8 推断的机制完全一致：
+PX 的 task 数是按「数据量 ÷ px_task_size」切出来的，2M 对于 2 万行的表切不出足够 task，
+worker 吃不饱；把 task size 调小，task 数变多，并行度就上来了。
+
+注意：CAPACITY 类型的参数**不接受纯数字**，写 `1048576` 会导致服务起不来，
+必须写 `256K` / `1M` 这种带单位的形式（第一次实验失败就是这个原因）。
+
+### 34.2 这一条为什么价值最大
+
+build 是 3 个指标 × 22.2 分/单位，此前一直是 0% 提升。
+20.3% 的建索引提升折合约 **3 × 22.2 × 0.20 ≈ 13 分**，超过本阶段全部 query 改动之和。
+
+### 34.3 还差最后一步：把默认值改到源码里
+
+比赛跑的是默认参数，`--parameter` 这条路在正式评测里用不上，必须改**参数默认值**。
+
+但本轮没找到定义位置：
+- `src/share/parameter/` 目录在这个精简构建里不存在；
+- `grep -rln px_task_size src/` 只命中 3 个**读取方**：
+  `src/sql/optimizer/ob_optimizer_util.cpp`、`src/sql/engine/px/ob_granule_util.cpp`、
+  `src/storage/ddl/ob_ddl_common_storage_impl.cpp`；
+- 定义很可能在宏生成的参数表里（`ob_parameter_seed.ipp` 之类），或 `deps/` 下。
+
+**下一轮第一步**：`grep -rn "px_task_size" . --include=*.ipp --include=*.h --include=*.ipp*`（含 deps 与生成目录），
+找到 `px_task_size` 的默认值 `2M` 并改成 `256K`；或者确认能否在 bootstrap 时用代码
+`ALTER SYSTEM SET px_task_size='256K'` 生效。
+
+### 34.4 需要一起考虑的副作用
+
+`px_task_size` 是全局参数，调小会让**所有**并行查询切出更多 task。
+对本赛题（小表、8 核）是有利的，但对大表可能增加调度开销。
+改默认值后必须重跑完整官方流程，确认 query 与 tokenize 没有回退。
