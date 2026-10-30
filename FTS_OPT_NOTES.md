@@ -2251,3 +2251,102 @@ dop 1~12 尾巴不变说明实际走的是①：切片号来自 DDL，而**消�
 下一轮确认三件事：①`T_PSEUDO_DDL_SLICE_ID` 的取值个数；②dist 是否把不同 slice 的行路由到不同 task；
 ③`ObTabletSliceParam::MAX_TABLET_SLICE_COUNT` 是否是暗坑上限。
 grep 起点：`T_PSEUDO_DDL_SLICE_ID`、`MAX_TABLET_SLICE_COUNT`、`ob_slice_calc.cpp`。
+
+## 44. 第三十六轮：drain 早就是并行的，真凶是「一张索引表 100% 落在一个 slice 上」
+
+这一轮把 §43 的靶点直接测掉了，结论与 §43.1 相反。
+
+### 44.1 先修一个环境事故：容器源码带着已回退的实验
+
+开工核对 host ↔ 容器时发现 **容器 `/work/seekdb` 的 `ob_fts_index_builder_util.cpp`
+里两处仍是 `MAX(original_parallelism, 8L)`**（§33.6 那个已回退的实验值），而 host `fts-final`
+是 `MAX(original_parallelism, 1L)`（§33.2 的正式值）。
+
+原因：容器的 git 基线 `5a29e2ce1` 不在 host 的历史里，`/work/build-final.sh` 又只做
+`git checkout final`（已在 `final` 上时是空操作），所以工作树里的实验值一直没被清掉。
+旧 `/work/seekdb.px256` 的 md5 是 `0f8619e8…`，即**出货二进制是从脏源码编出来的**。
+
+处理（按「host 唯一真源」）：把容器里 4 个有本地改动的文件（`parameters.yaml`、
+`ob_fts_index_builder_util.cpp`、`ob_sparse_daat_iter.cpp/.h`）逐个与 host 逐行比对——
+其余 3 个只有行尾差异，只有 builder 这一处语义不同（`8L` vs `1L`）。cp host→container +
+`sed -i 's/\r$//'` + `chmod 644` 后整编。
+
+- 新 `px256` md5 = **`e9d4b1a6e2b6611a205048662055d2d9`**（= host `fts-final` 的内容）。
+- 绿色复核（新二进制）：hits **8001 / 11000 / 7332 / 20**；
+  tokdump **80018 行，md5 `d620a35c914c3b1c7c15ca36337a7208`**；单次 rebuild 2705 ms。
+
+注意：§39/§43 的**绝对值**可能来自上面那个脏源二进制；它们的**方向性结论**不受影响
+（§33 的 A/B 是同源对比）。以后每轮开工都应该先跑一遍这个「4 文件比对」。
+
+### 44.2 直接测「消费者有几个」+「每个 slice 多少行」
+
+临时插桩（`FTSINS open / recv done / switch / tail close`、`FTSDIST range dist`，
+`ALTER SYSTEM SET syslog_level='info'`，跑完改回 `'error'`，代码已 `git checkout -- .` 回退）。
+一次 `DROP INDEX`+`ADD FULLTEXT INDEX fti_content_ik(content)` 的结果：
+
+- 一次 build 里其实有**两张**索引表（`idx_tid=590114/590115`，`ddl_task=223000064/223000071`），
+  每张各 **693336 行**。
+- insert op 的 task 个数是 **6 和 4**，`task_channels` 同样 6/4
+  —— **消费者不是 1 个**，它跟着 DDL 并行度 / px_task_size 那条线走。
+- 逐任务时间线（相对 open，ms）：
+
+| idx | task | slice | rows | recv 完成 | 写完成 |
+| --- | --- | --- | --- | --- | --- |
+| A | 0 | 0 | 62 666 | 45.255 | 45.255 |
+| A | 1 | 1 | 8 000 | 45.064 | 45.064 |
+| A | 2 | 2 | 11 334 | 45.055 | 45.055 |
+| A | 3 | — | **0** | 44.982 | — |
+| A | 4 | 4 | 113 999 | 45.495 | 45.495 |
+| A | 5 | 5 | **497 337** | **47.136** | 47.136 |
+| B | 0/1/2 | — | **0** | 45.267 | — |
+| B | 3 | 3 | **693 336** | **47.170** | 47.170 |
+
+`switch` 次数 = 0：每个 task 只写一个 slice，从不切换。
+于是「1.3 秒单线程尾巴」的真相是：**A 表最大那片 497k 行 + B 表独占的 693k 行**，
+两段各约 1.6 s 的独占写，且不在同一时刻，采样窗口里就只剩一个 PX_G0 在跑。
+
+### 44.3 dop 扫描：加切片救不了「退化表」
+
+`SET SESSION _force_parallel_ddl_dop=N` 各跑一次（每次先热身一遍），统计**每个 slice 的行数占比**：
+
+| dop | build_ms | 表 A：切片数 / 最大占比 | 表 B：切片数 / 最大占比 |
+| --- | --- | --- | --- |
+| 6 | 2836 | 4 片，34% | **1 片，100%** |
+| 12 | 3843 | 4 片，34% | **1 片，100%** |
+| 23 | 3665 | 7 片，28% | **1 片，100%** |
+
+- 表 A 随切片数略微变均匀（34% → 28%；另一次默认 dop=6 的跑法上还见过 72%，说明 A 的切分本身也在 8k~497k 之间大幅波动）；
+- 表 B **永远 100% 落在一个 slice**，dop 6/12/23 一模一样；
+- build_ms 2836 / 3843 / 3665 都在本机噪声带内（同会话基线 2705~2942），**没有收益**。
+
+这也解释了 §39.2（4/6/8/12 无差别）与 §43（dop=1/2/6 形状一样）：
+切片数上限是 `min(expected_task_count, hint_parallelism)`（`ob_ddl_common_storage_impl.cpp:486`），
+dop=23 时确实切出了 7 片，**但表 B 的 range_idx 恒为同一个值，切片再多也只有一片有数据**。
+
+### 44.4 靶点改写（§43 部分作废）
+
+- §43.1「sort→write 的 drain 由 1 个 PX worker 独占」→ 只在**表 B** 上成立，而且原因不是
+  「消费者被定成 1」（消费者有 4~6 个），而是**切片号分配退化**：表 B 的所有行拿到同一个
+  `DDL_SLICE_ID`，于是全部被路由到同一个 channel，其余消费者空转。
+- 表 A 的切片分配是有效的（4~7 片），它的尾巴只是「最大那片」。
+- 所以「让 sort→write 的 drain 并行起来」这个靶点**已经不需要做**：drain 本来就是并行的。
+  缺的是「表 B 的 key 空间切分」。
+
+### 44.5 下一轮要确认的三件事（代码坐标）
+
+1. 表 B 的 `dist_exprs_` 与 `range_cut_` 是否是同一个 key 空间。
+   `ObRangeSliceIdCalc::get_slice_idx_batch_inner`（`ob_slice_calc.cpp:1367`）用
+   `std::lower_bound(range_cut_, sort_key)` 定位 `range_idx`；若 `sort_key` 是 word（varchar）、
+   `range_cut` 是 doc_id（int），比较结果恒定 → `range_idx` 恒定 → 全落一片。
+   这与「A 正常、B 退化」的观测完全吻合，是目前最强的解释。
+2. 两张索引表的主键列顺序（表 B 是否 word-leading）。
+3. 若确认是 key 空间错配：能安全做的只有「在**目标 key 空间**里切片」，而那需要 word 分布统计；
+   **不能**改成 hash/round-robin 分片——那会让各 slice 的键区间重叠，破坏有序写不变量（§42.1）。
+
+### 44.6 本轮状态
+
+- `fts-final` 仍是 `5b2310ecc` 的行为，本轮唯一改动是本文档；host 工作树干净，可直接提测。
+- 容器源码已与 host 对齐（4 个文件），运行的 `px256` = `e9d4b1a6e2b6611a205048662055d2d9`。
+- `/work/seekdb.instr` 是本轮插桩实验版（`FTSINS`/`FTSDIST`），**不要出货**。
+- 新增可复用脚本：`/work/measure3.sh`（逐任务时间线）、`/work/sweep.sh`（dop 6/12/23 + 每片行数）、
+  `/work/hits.sql`（四道命中数门槛）、`/work/restore.sh`（4 文件与 host 比对/还原）。
