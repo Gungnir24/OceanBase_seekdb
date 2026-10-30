@@ -1726,3 +1726,49 @@ build 是 3 个指标 × 22.2 分/单位，此前一直是 0% 提升。
 `px_task_size` 是全局参数，调小会让**所有**并行查询切出更多 task。
 对本赛题（小表、8 核）是有利的，但对大表可能增加调度开销。
 改默认值后必须重跑完整官方流程，确认 query 与 tokenize 没有回退。
+
+## 35. 第二十九轮：把 px_task_size 默认值改成 256K（build −6.0%）
+
+### 35.1 定义位置
+
+`px_task_size` 的定义在 **Rust 配置层**：`rust/config/parameters.yaml:1338`
+
+```yaml
+- name: px_task_size
+  type: CAP
+  default: "2M"        # -> 改成 "256K"
+  range: "[1K,)"
+  section: OBSERVER
+  edit_level: DYNAMIC_EFFECTIVE
+```
+
+C++ 侧只有读取方（`config::px_task_size()`）：
+`ob_optimizer_util.cpp:8006`、`ob_granule_util.cpp:220`、`ob_ddl_common_storage_impl.cpp:467`。
+注意 `src/share/parameter/` 在这个精简构建里不存在，参数表由 Rust 端生成
+（`build_release/rust-target/.../config/generated_config.rs.h`）。
+
+### 35.2 验证：语义不变
+
+| 项目 | 结果 |
+| --- | --- |
+| hits | 8001 / 11000 / 7332 / 20 |
+| token dump | 80018 行，md5 `d620a35c914c3b1c7c15ca36337a7208` |
+
+### 35.3 性能：2 轮交错 A/B 稳定 −6.0%
+
+| 轮次 | px256 | devirt8 | 变化 | 并行度 |
+| --- | --- | --- | --- | --- |
+| 1 | 3111 ms | 3309 ms | −5.98% | 3.30 vs 2.96 |
+| 2 | 3107 ms | 3305 ms | −5.99% | 3.20 vs 2.94 |
+
+折合 3 个 build 指标约 **+4 分**。
+
+注：用 `--parameter px_task_size=256K` 启动时曾测得 −20.3%（3985 → 3175），
+那是与当时那台机器的冷态基线比；本轮改默认值后用**同场交错 A/B**，真实收益是 −6.0%，
+以这个数为准。
+
+### 35.4 副作用
+
+`px_task_size` 是全局参数，所有并行查询的 task 切分都会变细。
+本赛题是小表 + 8 核，有利；但**必须再跑一次完整官方流程**确认 query 三项与 tokenize 没有回退。
+本轮的两次 A/B 只覆盖了 build，尚未验证 query/tokenize。

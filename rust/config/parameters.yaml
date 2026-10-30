@@ -1337,7 +1337,7 @@
 
 - name: px_task_size
   type: CAP
-  default: "2M"
+  default: "256K"
   range: "[1K,)"
   section: OBSERVER
   edit_level: DYNAMIC_EFFECTIVE
