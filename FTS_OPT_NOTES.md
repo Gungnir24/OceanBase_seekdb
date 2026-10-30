@@ -1478,3 +1478,62 @@ JSON 树构造仅 0.99%、整条序列化链约 5%，其余单项全部 ≤0.95%
 **在本赛题允许的语义不变前提下，`fts-final` 的 devirt8 已到可优化空间的边界。**
 若要继续提分，需要改变前提：要么拿到 CI 基线的真实数值以确认哪些指标真正值分，
 要么接受在通用内核代码里冒险的代价。
+
+## 32. 第二十二轮（转向）：build 的并行度只有 2.4，这是唯一剩下的量级级空间
+
+前面所有工作都是在**单线程指令级**抠百分比。这一轮换了个维度：先问「机器到底被用满了没有」。
+
+### 32.1 测量：建索引只用了 8 核里的 2.4 核
+
+| 语句 | wall | CPU | 平均并行度 |
+| --- | --- | --- | --- |
+| `build_ik_all` | 4.17 s | 8.91 s | **2.13** |
+| `build_beng_en` | 1.53 s | 3.69 s | **2.41** |
+
+按线程采样（2 秒窗口内每个 PX worker 的 CPU 占比）：
+
+```
+PX_G0 222917  35.75%
+PX_G0 222925  35.25%
+PX_G0 222927  24.75%
+PX_G0 222924  22.25%
+PX_G0 222920  21.00%
+DDLTaskExecutor ×3   合计约 4.5%
+窗口内总 CPU = 3.06 核（共 8 核）
+```
+
+**只有 5 个 PX worker 在干活，而且负载明显不均衡**（35% / 35% / 25% / 22% / 21%）。
+
+### 32.2 试过的手段无效
+
+- `ALTER TABLE docs PARALLEL 8;` 之后再建索引：wall 3.55 s、CPU 8.71 s、并行度 2.46；
+  改回 `PARALLEL 1`：wall 3.54 s、CPU 8.63 s、并行度 2.43。
+  **完全无差别**——表级并行度不影响这条 DDL。
+- 这个精简版 seekdb 里 `parallel_servers_target`、`_px_max_parallel_worker_count` 等参数**根本不存在**
+  （`SHOW PARAMETERS LIKE '%parallel%'` 返回空），`cpu_count` 为 0（自动取 8）。
+- `GV$OB_SQL_AUDIT` / `GV$OB_PARAMETERS` / `DBA_OB_TABLE_LOCATIONS` 视图在这个构建里也都缺失，
+  拿不到 `expected_worker_count` / `used_worker_count`。
+
+### 32.3 为什么这是量级级空间
+
+build 是三个指标（`build_ik_all`、`build_ik_content`、`build_beng_en`），每个 22.2 分/单位。
+目前是 0% 提升。如果把并行度从 2.4 提到 6，即使考虑串行部分，wall 也有 1.8~2 倍空间，
+折合 3 × 22.2 × 0.45 ≈ **30 分**——远超本阶段 query 那 7 个改动加起来的效果。
+
+### 32.4 下一个要查的点
+
+DDL 的 DOP 是在哪里决定的？候选：
+
+1. `ObFtsIndexBuilder` / FTS DDL task 是否显式把 DOP 设成了 1 或 2；
+2. PX 计划里这个 DDL 的 DOP 是否来自 `cpu_count` 之外的其它默认值；
+3. 非分区表（`docs` 只有主键、无分区）是否让「写入 SSTable」阶段退化成单分区串行，
+   而扫描/排序仍在并行——这与「5 个 worker 负载不均」的观测一致。
+
+第 3 种如果成立，改动会落在 DDL 分区分发逻辑上，风险高、收益也可能最大。
+
+### 32.5 顺带确认的查询侧事实
+
+四个查询指标里三个是 `SELECT COUNT(*)`，执行计划均为
+`SCALAR GROUP BY → TEXT RETRIEVAL SCAN`，且都带 `calc_relevance=true`；
+`query_limit` 还额外带 `sort_keys([MATCH(...) DESC]), limit(20)` 与 `is_index_back=true`。
+相关性剥离已在 §17 测过是持平，这里不再重复。
