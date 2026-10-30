@@ -1608,3 +1608,21 @@ FTS 索引的建立被硬编码只给三分之一的并行度。实测机器上�
 **下一步**：既然 8 核只用 2.4 核，就还有 3 倍空间。需要找到真正决定 PX worker 数的位置。
 这条 DDL 的计划由 `ob_fts_index_build_task.cpp` 发起，`parallelism_` 只是其中一环；
 还要看 `ObPxMultiPartSSTableInsertOp` 计划生成时 `expected_worker_count` 的来源。
+
+### 33.6 追试：把并行度强制拉到 8，毫无变化（已回退）
+
+为确认 `decide_parallelism` 是否就是并发上限的来源，把该分支临时改成
+`MAX(original_parallelism, 8L)`（无条件至少 8）重新编译测：
+
+| 版本 | build_ik_all（3 遍平均） | 实测并行度 |
+| --- | --- | --- |
+| dop8（强制 ≥8） | 3868 / 3879 ms | 2.42 |
+| par3（§33 的改动） | 3850 ms | 2.42 |
+
+**并行度一点没变（都是 2.42），耗时也没变**。说明 `decide_parallelism` 的返回值
+并不是 PX 实际使用的 worker 数，真正的并发上限在别处（PX worker 池大小或计划里另一个 DOP 来源）。
+
+实验已用 `git checkout` 回退，分支保留 §33 的 par3 版本。
+§33 那 −2.45% 的收益是真实的（本轮 par3 复测 3850 ms，与之前 3804~3974 一致，
+对比 devirt8 的 3871~4155），但**机制不是「增加了 worker 数」**——
+更可能是 `parallelism_` 在别处影响了任务切分粒度。
