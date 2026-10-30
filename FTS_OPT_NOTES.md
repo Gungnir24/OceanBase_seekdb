@@ -1646,3 +1646,38 @@ FTS 索引的建立被硬编码只给三分之一的并行度。实测机器上�
 2. `ObGranulePump` 的 `args.parallelism_` 与 `args.tablet_size_`（971 行有 `parallelism_<=0 || tablet_size_<=0` 的告警）——
    非分区表单 tablet 会不会让 task set 只能切出 1~2 个；
 3. `ObPxPool` 的线程数上限。
+
+### 33.8 并行度的真正决定方式：按数据量切 task，不是按 DOP
+
+追到 `ObOptimizerUtil::compute_nlj_spf_storage_compute_parallel_skew`（`ob_optimizer_util.cpp:7989`）：
+
+```cpp
+data_plane::ObParallelRangeTaskParams params(config::px_task_size() >> 10);
+params.parallelism_ = compute_parallel;
+...
+int64_t esti_table_size = (micro_block_count_ * micro_block_size_) / 1024;   // KB
+...
+ObParallelRangeTaskPlanner::compute_total_task_count(params, esti_table_size, esti_task_cnt_by_data_size);
+```
+
+关键点：**task 数量是由「表的数据量 ÷ `px_task_size()`」算出来的**，不是由 DOP 直接决定。
+DOP 只是 `params.parallelism_` 的一个输入，真正的 task 数还受 `esti_table_size` 与 `px_task_size()` 约束。
+
+这完整解释了 §32~§33.7 的全部观测：
+
+- 8 核只用 2.4 核；
+- 把 DOP 从 2 提到 8 完全无效（`par` 恒为 2.42）；
+- 只有 5 个 PX_G0 线程在跑；
+- 表小、micro block 少 → `esti_table_size` 小 → 切出的 task 少 → worker 吃不饱。
+
+**下一轮的可执行方案**（按风险从低到高）：
+
+1. **低风险**：确认 `px_task_size()` 的默认值。如果它偏大（例如 8MB 级），
+   表只有 2 万行时切出的 task 数会很少。若它可运行时调整，先用
+   `--parameter px_task_size=<更小值>` 验证「是不是这个参数卡住了并行度」——
+   这是纯参数实验，不改代码。
+2. **中风险**：若参数实验有效，再决定是改默认值还是让 FTS 建索引路径显式使用更小的 task size。
+3. **高风险**：改 `compute_total_task_count` 的切分策略，让非分区小表也能切出足够 task。
+
+注：上面追到的这个函数是 NLJ SPF 路径，FTS 建索引 DDL 是否走同一条函数**尚未确认**，
+下一轮必须先确认这一点，避免又出现「改错位置」的情况（§28.3 的教训）。
