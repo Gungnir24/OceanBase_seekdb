@@ -2147,27 +2147,29 @@ query 1.0519 / 1.466 / 1.1244 / 1.6833。CI 机器上 `select1=0.0256 ms`（本�
 1. 让写入不要求全局 slice 顺序（每个 slice 独立写自己的 sstable 片段）；
 2. 让索引 tablet 分成多个分区，写入天然并行（这会改变查询侧的扫描方式，需重新验证 query）。
 
-## 42. 第三十四轮：读代码确认「并行写」这条路本来就存在，只是 FTS 建索引没走
+## 42. 第三十四轮：两个写入模式到底是怎么回事（并纠正一个错误推断）
 
-### 42.1 `ObPxMultiPartSSTableInsertOp` 有两个写入模式
+### 42.1 `ObPxMultiPartSSTableInsertOp` 的两种模式，与「并行写」无关
 
-`src/sql/engine/pdml/static/ob_px_sstable_insert_op.cpp`：
+`src/sql/engine/pdml/static/ob_px_sstable_insert_op.cpp` 里确实有两个入口：
 
-| 模式 | 入口 | slice 归属 | 写入并行性 |
+| 模式 | 入口 | 触发条件 | slice 归属 |
 | --- | --- | --- | --- |
-| 有序 | `write_ordered_slice_by_row()`（第 461 行） | 由行上的 `ObTabletSliceParam.slice_idx_` 决定，`switch_slice_if_need()` 逐行切换 writer | **同一时刻只有一个 slice 在写**，且必须等前一片写完 |
-| 堆 | `write_heap_slice_by_row()`（第 430 行附近） | `request.slice_index_ = ctx_.get_px_task_id()`，`request.parallel_count_ = task_count` | **每个 PX task 各写自己那片**，互不等待，最后由 tablet 侧多 slice 归并 |
+| 有序 | `write_ordered_slice_by_row()`（第 461 行） | 普通表（有真实主键） | 由行上的 `ObTabletSliceParam.slice_idx_` 决定，`switch_slice_if_need()` 逐行切换 writer |
+| 堆 | `write_heap_slice_by_row()` | `is_heap_plan()`：`regenerate_heap_table_pk_ \|\| is_vec_gen_vid_`（**堆表且要重建主键**） | `request.slice_index_ = ctx_.get_px_task_id()` |
 
-分派点在 `inner_get_next_row()`：`is_heap_plan()` 为真走堆模式，否则走有序模式。
-§39.4 的 profile 里 81% 是 `write_ordered_slice_by_row`，说明 **FTS 建索引用的是有序模式** ——
-这正是那 1.3 秒尾巴的来源：有序模式下写入必须串行、且要等最后一片的数据凑齐。
-并行 DML（`INSERT /*+ ENABLE_PARALLEL_DML */`）走的是堆模式，写出的是「多 slice 有重叠、由
-tablet 归并」的 sstable，是框架本来就支持的形态。
+我一开始以为「堆模式 = 每个 task 各写一片 = 现成的并行写入，只是 FTS 没走」，**这个推断是错的**：
+堆模式存在的理由是堆表要按 task 重新生成隐藏主键，避免各 task 主键冲突；
+它不是因为「可以并行写」而存在，而且堆表写出的 slice 之间是重叠的、靠 tablet 侧归并。
 
-**所以「让写入并行」不需要新造机制，只需要让 FTS 索引构建的 DDL 走堆模式**
-（或让它不再要求全局有序）。这是下一轮真正的靶点，但属于计划层改动：
-要确认索引构建计划去掉排序后仍然正确（行的 key 顺序由 tablet 多 slice 归并保证），
-并且 query 侧对新 sstable 形态的读取结果不变（hits/tokdump 是硬门槛）。
+普通表（FTS 索引表就是普通表，有真实主键 `(word, doc_id)`）只能走有序模式：
+**行必须按 key 有序地喂给 writer**，writer 才能顺序切微块/宏块。
+所以「每片独立写、最后归并」这套在有真实主键的索引表上并不成立——
+有序性是 sstable 微块正确性的前提，不是可选项。
+
+结论修正：**§41.5 的那 1.3 秒尾巴没有现成的开关可以打开**，
+要消掉它得让 direct-insert 层支持「多片有重叠、按片各写一段、由 tablet 归并」的索引表构建方式，
+属于实打实的设计改动（不是配置或小改），必须先做等价性验证再做性能评估。
 
 ### 42.2 顺带确认：query 的归并路径已经是我们优化过的形态
 
@@ -2185,6 +2187,6 @@ tablet 归并」的 sstable，是框架本来就支持的形态。
 
 ### 42.4 结论
 
-三条路径的可摘收益已经见底；**唯一还有量级（~1.3 s / 45% build 墙钟）的靶点是 §42.1 的写入模式切换**。
-它需要单独一轮：先做「堆模式构建出的索引，hits/tokdump 与有序模式完全一致」的等价性验证，
-再谈性能。在拿到这个等价性证据之前，不动 `fts-final` 的绿状态。
+三条路径的可摘收益已经见底。剩下的 1.3 s（45% 的 build 墙钟）需要「索引表的多片并行构建」这一
+设计级改动，风险高、周期长；在有等价性证据之前不动 `fts-final` 的绿状态。
+本轮之后分支仍是 `5b2310ecc` 的行为 + 纯文档提交。
