@@ -1947,3 +1947,94 @@ inclusive：`ObTableScanOp::inner_get_next_batch_for_das` 86.3% → `ObDASMergeI
 | `/work/measure-threads.sh` | build 期间 `top -H` 线程级 CPU 采样 |
 | `/work/prof2.sh` | build 与 query 的 perf 采样（inclusive 与 flat 两种视图） |
 | `/work/pq.sh` / `/work/ex.sh` | 查询并行 hint 的计时与计划对比 |
+
+## 39. 第三十一轮：build 的墙钟不是并行度决定的，是 1.3 秒的单线程尾巴
+
+§37 的线程采样只能看到「某一瞬间」的负载，这一轮换成**按时间切片**看并发度，结论完全改观。
+
+### 39.1 工具：不用重编就能扫 DDL 并行度
+
+`src/sql/resolver/ddl/ob_ddl_resolver.cpp:7761` 读的是会话变量 `_force_parallel_ddl_dop`
+（隐藏 sysvar，`ob_system_variable_init.json` 里有定义），`>1` 时直接作为 DDL 并行度：
+
+```sql
+SET SESSION _force_parallel_ddl_dop=12;
+```
+
+于是可以把 `DDL_DEFAULT_PARALLELISM`（编译期常量，当前 6）在**运行时**换成 4/6/8/12，
+不必每换一档重编一次。我用 INFO 日志确认它真的生效：
+`calc_ddl_parallelism ... (parallelism=12)`（`ob_ddl_resolver.cpp:7782`）。
+
+### 39.2 结果：4 / 6 / 8 / 12 四档没有差别
+
+每档 9 次 `build_ik_content`（3 轮交错，脚本 `/work/run-dop-sweep.sh` + `/work/abp3.sh`）：
+
+| DDL 并行度 | 9 次均值 | par 范围 |
+| --- | --- | --- |
+| 4 | 2806 ms | 2.87 ~ 3.18 |
+| **6（当前值）** | **2655 ms** | 2.60 ~ 3.13 |
+| 8 | 2774 ms | 2.94 ~ 3.24 |
+| 12 | 2834 ms | 2.92 ~ 3.31 |
+
+四档互相之间的差异都在噪声内（第 3 轮整体偏慢、第 1 轮首测偏慢），**并行度不是墙钟的决定因素**。
+为验证「把并行度改到 8 有没有用」，我把 `DDL_DEFAULT_PARALLELISM` 改成 8 单独编了一版
+（`/work/seekdb.dop8`，md5 `fd6c6f84...`），结论一致：**没有可验证收益，已回退到 6**。
+
+### 39.3 真正的时间结构：100 ms 粒度的并发度时间线
+
+对一次 build 每 100 ms 读一次 `/proc/<pid>/stat` 的 utime+stime，算该区间的平均并发度：
+
+```
+0.0–0.3s   par 0.5 ~ 2.6     计划/建任务
+0.3–0.8s   par 7.8 6.9 7.2 7.3 6.8     ← 扫描+分词+排序，机器基本吃满
+0.8–1.2s   par 4.6 3.3 2.2 1.9         ← 收尾，worker 陆续空闲
+1.2–2.5s   par 1.3 1.2 1.1 1.1 1.2 ...  ← 1.3 秒只有 ~1.2 核在跑
+2.5–2.9s   par 0.9 0.2 0.3             ← DDL 提交/等待
+```
+
+墙钟 2.9 s，其中**并行段只有约 0.5 s**，**1.3 s 是单线程尾巴**。
+按 CPU 计：尾巴只占全部 CPU 的 ~18%，却吃掉了 45% 的墙钟。
+`par=3.0` 这个「用了 3 个核」的数字就是这么来的——不是全程 3 核，而是「0.5 秒 7.5 核 + 1.3 秒 1.2 核」。
+
+### 39.4 尾巴里在做什么（只采样尾巴窗口）
+
+`perf record` 只覆盖 1.4 s → 2.7 s 的窗口，两次重复：
+
+| 占比 | 符号 |
+| --- | --- |
+| 81 ~ 86% | `ObPxMultiPartSSTableInsertOp::write_ordered_slice_by_row` |
+| 40 ~ 53% | `└ ObMacroBlockWriter::...`（微块/宏块写入，`crc64_sse42` 6.6% self、`memmove` 3.3% self） |
+| 22 ~ 31% | `└ ObSortOp::process_sort_batch` → `sort_inmem_data` 22.5% / `Compare` 2.2%（`ob_sort` 13.8%） |
+
+也就是说，尾巴是**某一个 slice 还在做「排序 + 写宏块」**，其余 slice 都已完成。
+
+### 39.5 为什么加 slice 数没用
+
+把并行度从 6 提到 12 后时间线**结构完全一样**（0.5 s 并行段 + 1.3 s 单线程尾巴），
+尾巴里的符号也一样。合理解释：切片的**粒度受源表可切分的 range 数限制**
+（`split_multi_ranges` 按 range 切，range 边界只能落在宏块/微块边界上），
+2 万行的表只有几个宏块，12 个任务里有一部分拿不到数据，真正的最后一片并不会因为
+并行度变大而变小。这也解释了 §35 注释里那句话（「6 是实测甜点，再多只会增加竞争」）
+——当时看到的现象是对的，但原因不是「竞争」，而是**切片粒度到顶 + 单片长尾**。
+
+### 39.6 结论与本轮交付
+
+- `DDL_DEFAULT_PARALLELISM` **保持 6**；8 的改动已回退（host 与容器源码都已还原，`git status` 干净）。
+- 本轮没有新的代码改动上线，`fts-final` 仍是 `5b2310ecc` 的行为。
+- 要把 build 从 2.9 s 再往下压，必须让**最后一片变小**，可选方向（都需要动 DDL/PX 框架，下一轮再评估）：
+  1. 让 `split_multi_ranges` 在宏块内部继续切（微块/行级 range），使 12~24 个切片都能分到相近的数据量；
+  2. 把「写入宏块」这一步从单 tablet 单写者解放出来（当前一个索引 tablet 只有一份 sstable writer）。
+- 复现脚本：`/work/time2.sh`（时间线 + 并行度验证）、`/work/tail-prof.sh`（尾巴窗口采样）、
+  `/work/run-dop-sweep.sh`（并行度四档扫描）。
+
+### 39.7 本轮绿色确认（px256，skip_load=0 全量重装）
+
+| 项目 | 结果 |
+| --- | --- |
+| build_ik_all / content / beng | 3.065 / 2.634 / 1.529 s |
+| tokenize_ik / beng | 0.2524 / 0.1796 ms |
+| query cn / beng / mixed | 1.7404 / 2.4867 / 1.9804 ms |
+| hits | 8001 / 11000 / 7332 / 20 |
+| tokdump | 80018 行，`d620a35c914c3b1c7c15ca36337a7208` |
+
+注：`/work/seekdb.dop8` 是「并行度 8」的实验二进制（md5 `fd6c6f84...`），**不要当出货版本**。
