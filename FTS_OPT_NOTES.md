@@ -2350,3 +2350,57 @@ dop=23 时确实切出了 7 片，**但表 B 的 range_idx 恒为同一个值，
 - `/work/seekdb.instr` 是本轮插桩实验版（`FTSINS`/`FTSDIST`），**不要出货**。
 - 新增可复用脚本：`/work/measure3.sh`（逐任务时间线）、`/work/sweep.sh`（dop 6/12/23 + 每片行数）、
   `/work/hits.sql`（四道命中数门槛）、`/work/restore.sh`（4 文件与 host 比对/还原）。
+
+## 45. 续 §44：切片数是 4/6，不是 1 —— 退化的原因是 cut key 与 sort key 不在同一空间
+
+§44 猜「表 B 可能只声明了 1 片」。直接测：在 `get_tablet_info_from_row` 里打印声明出来的
+`slice_count_`/`slice_idx_`（`FTSDBG slice`），在 `do_range_dist` 里打印 `range_cut_.count()`、
+`range_null`、`dist_exprs_.count()`（`FTSDBG dist`）。一次 build 的结果：
+
+| ddl_task | slice_count | range_cut | task_cnt | 实际收到数据的 slice |
+| --- | --- | --- | --- | --- |
+| 226000773 | **6** | 5 | 6 | 0, 1, 2, 5（多片，工作正常） |
+| 226000780 | **4** | 3 | 4 | **只有 3**（其余 3 个 task 收 0 行） |
+
+`dist_exprs` 两张表都是 2；`range_null=false`（range 是拿到的，不是空）。
+
+**所以切片数是正常的 4/6，退化的不是「切了几片」，而是「每行算出来落在第几片」。**
+`ObRangeSliceIdCalc::get_slice_idx_batch_inner`（`ob_slice_calc.cpp:1367`）对每行做
+`range_idx = lower_bound(range_cut_, sort_key)`：
+- 工作正常那张表，`range_idx` 在 0~5 之间散开；
+- 退化那张表，**所有行都 `lower_bound` 到最后一个区间**（`range_idx = 3 = range_cut.count()`），
+  于是 `slice_indexes_[idx] = 3 % 4 = 3`，全部行被路由到 channel 3，另外 3 个消费者空转。
+
+这就是 §44.3 里「dop 6/12/23 那张表永远 100% 一片」的机制：**切几片都一样，因为切分键不区分这些行**。
+root cause 就是 §44.5 的猜测，现在有数据了：两张 FTS 辅助表的主键列顺序不同
+（`ob_fts_index_builder_util.cpp:538-552`）——FTS 倒排表是 **word 在前**，doc_word 表是 **rowkey/doc_id 在前**；
+而 `range_cut_` 是从基表（docs）的 doc 区间来的。doc-id 区间对 word 主导的表没有区分度，
+`lower_bound` 恒返回末尾。
+
+### 45.1 为什么不能「随手改成 hash/round-robin 分片」
+
+`ObTabletSliceParam::MACRO_BLOCK_SEQ_INTERVAL = 1<<32`（`ob_ddl_seq_generator.h:68`）：
+一个 tablet 的宏块序号 = `slice_idx * 2^32 + 片内序号`。也就是说各 slice 的宏块在**同一个 tablet 里按
+slice_idx 顺序拼接**，因此 slice k 的键必须整体小于 slice k+1 的键。按 hash/轮转分片会让各片键区间重叠，
+拼接出来的 tablet 就不是按键有序的 → 读路径直接坏。**不能做。**
+
+### 45.2 两条真正可行的路（都超出「改一行」的范围）
+
+1. **在 word 空间里切分**：cut key 必须是 word 值。DDL 现在没有 word 分布，
+   `do_range_dist` 里已经有 dynamic sample 的骨架（`build_ds_piece_msg` / `do_datahub_dynamic_sample`），
+   把采样接到 word 上、用采样分位点当 cut key，是正道；代价是采样本身要扫一遍数据。
+2. **让这张表改成「每个 task 一份独立 sstable」的并行写**：LSM 本来允许一个 tablet 多份 sstable
+   （键区间重叠也能 merge），但 direct-load 这条路径（`DIRECT_INSERT_ORDERED_WRITER`）是按「单 sstable 切片
+   拼接」实现的，要动框架不变量（§42.1），风险和工程量都大。
+
+前者是「有据可依但要做采样」，后者是「框架级改动」。两条都不是本轮能安全落地的，
+所以**本轮仍然没有性能改动**：`fts-final` 代码 = `5b2310ecc`，只多文档。
+
+### 45.3 两个环境坑（顺手记下来）
+
+- `cp -f <build_release>/src/observer/seekdb /work/seekdb.instr` 会出现**静默不生效**（目标文件 mtime 不变、
+  内容还是旧的），导致「明明重编了却在跑旧二进制」。两次踩到。规避：每次用**新文件名**
+  （`instr5`、`instr6`…），并且用 `strings -a <bin> | grep -c <日志标记>` 确认标记在里面再起服务。
+  §44.1 那次「px256 是脏源编的」很可能也是同一类问题叠加。
+- `docker exec ... bash -c "..."` 在 Windows PowerShell 下会把内层引号吃掉（`-h127.0.0.1` 变成 `127`、
+  SQL 只剩 `SELECT`、`$(...)` 报 `unexpected EOF`）。稳妥做法：**把命令写成脚本文件再 `docker cp` 进去跑**。
