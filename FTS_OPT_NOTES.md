@@ -1240,3 +1240,62 @@ collect_dims_by_id                                  3.16%
 
 剩余唯一有量级空间的是 §22.2 的 tokenize JSON 直出（4~6%），
 需要在 SQL 层逐字节对齐 `ObJsonBin` 布局，留待上下文充足的轮次单独实施。
+
+## 28. 第十九轮：§22 的 JSON 直出方案作废 —— 真凶是 segment
+
+之前（§22）我根据 inclusive profile 里 `tokenize_fulltext` 占 28.57%、序列化链占约 10~12%，
+判断「JSON 输出是 tokenize 的剩余大头」，并把这当成唯一待办。本轮把 `tokenize_fulltext` 的
+子节点拆开量，结论完全不同：
+
+| 层级 | 占比 | 符号 |
+| --- | --- | --- |
+| 子节点 | **26.74%** | `ObFTParseHelper::segment(...)`（真正的分词） |
+| 子节点 | **0.99%** | `ObFTParseHelper::make_token_array_json(...)`（JSON 树构造） |
+| 后续链 | 2.26% | `ObIJsonBase::get_raw_binary` |
+| 后续链 | 2.15% | `ObJsonBaseFactory::transform` |
+
+也就是说：**JSON 树构造只有 0.99%，整条二进制序列化链约 5%，而分词本身占 26.74%。**
+§22 把「28.57% 的 tokenize_fulltext」误当成了 JSON 构造，实际上那是 segment 的时间。
+按这个比例，就算把 JSON 直出做到极致（省掉 transform 与 parse_tree），上限也只有 2% 左右，
+而且要冒逐字节对齐 `ObJsonBin` 的风险。**方案作废，不再执行。**
+
+### 28.1 segment 内部构成（flat self）
+
+| 占比 | 符号 | 性质 |
+| --- | --- | --- |
+| 3.02% | `ObFTCacheDict::match_with_hit` | 双数组 trie 走查 |
+| 2.78% | `ObFTDATReader<void>::get_word_code` | 哈希表查词码 |
+| 2.58% | `ObFTDATReader<void>::match_with_hit` | 双数组 trie 走查 |
+| 1.51% | `__memcmp_avx2_movbe` | 哈希键/词面比较 |
+| 1.26% | `ObFTRangeDict::find_first_char_range` | 区间二分（已优化过） |
+| 0.95% | `__memmove_avx_unaligned_erms` | — |
+| 0.88% | `PageArena::_alloc_aligned` | 内存池 |
+| 0.77% | `ObIKCJKProcessor::do_process` | 分词主循环 |
+| 0.74% | `ObFTCharUtil::decode_unicode` | 字符解码 |
+| 0.64% | `__strlen_avx2` | — |
+| 0.62% | `ob_hash_sort_utf8mb4` | 词归一化 |
+| 0.59% | `pthread_spin_lock` | — |
+| 0.54% | `ObCharset::get_charset` | — |
+| 0.53% | `ob_casedn_utf8mb4` | 大小写折叠 |
+
+**字典层（前 5 项）合计约 11.15%**，其余全部 ≤0.95%，没有任何单点值得动。
+
+### 28.2 结论：tokenize 这条线到此为止
+
+- JSON 直出：上限约 2%，作废；
+- 跨语句词码缓存：只能省 `get_word_code` 的 2.78%，上限约 0.9 分，且需要跨词典实例地址的键（§21），不做；
+- trie 走查（`match_with_hit` 5.6%）：是分词算法的核心，改写风险远大于收益；
+- 其余页面元操作（内存池、解码、归一化、锁）单项都在 1% 以下。
+
+**tokenize 已到实际下限，后续不再在此方向投入。**
+
+### 28.3 方法论教训
+
+这是本项目第三次被 profile 的「层级」骗到：
+
+1. §2：ICF 让 flat 符号不可信；
+2. §26：ICF 让 `at()` 的 self 时间变成所有调用者之和；
+3. §22 → §28：把父节点的 inclusive 时间当成子节点的开销。
+
+**规则**：判断某函数是不是瓶颈，必须同时看它的 self、它的子树总时间、以及它子节点的占比；
+只看父节点 inclusive 就立项，一定会找错对象。
