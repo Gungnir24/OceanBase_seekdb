@@ -25,6 +25,7 @@ mkdir -p "$(dirname "$OUTPUT")"
   -fPIC \
   -O2 \
   -D__HIP_PLATFORM_AMD__ \
+  -D_GNU_SOURCE \
   -I"$HIPVS_ROOT/include" \
   -I"$ROCM_ROOT/include" \
   "$SCRIPT_DIR/seekdb_cuvs_bridge.c" \

@@ -10,6 +10,7 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 typedef struct {
   cuvsResources_t        res;
@@ -17,6 +18,28 @@ typedef struct {
   cuvsCagraIndex_t       idx;
   long n, dim;
 } sk_cuvs_index;
+
+/* Build knobs. The defaults are the frozen V5 values; the env overrides exist so
+ * the parameters can be swept without a rebuild and then baked back in here. */
+static int sk_env_int(const char *name, int fallback)
+{
+  const char *v = getenv(name);
+  if (v == NULL || v[0] == '\0') return fallback;
+  return atoi(v);
+}
+
+static int sk_timing(void)
+{
+  const char *v = getenv("SEEKDB_CUVS_TIMING");
+  return v != NULL && v[0] == '1';
+}
+
+static double sk_now_ms(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
 
 void* seekdb_cuvs_build(const float* base, long n, long dim)
 {
@@ -33,11 +56,20 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = NN_DESCENT;
-  h->ip->graph_degree = 128;
-  h->ip->intermediate_graph_degree = 256;
-  h->ip->nn_descent_niter = 100;
+  h->ip->graph_degree = (size_t)sk_env_int("SEEKDB_CUVS_GRAPH_DEGREE", 128);
+  h->ip->intermediate_graph_degree = (size_t)sk_env_int("SEEKDB_CUVS_INTERMEDIATE_DEGREE", 256);
+  h->ip->nn_descent_niter = (size_t)sk_env_int("SEEKDB_CUVS_NITER", 100);
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
-  if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
+  {
+    double t0 = sk_timing() ? sk_now_ms() : 0.0;
+    if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
+    if (sk_timing()) {
+      fprintf(stderr, "[seekdb_cuvs] build n=%ld dim=%ld gd=%zu igd=%zu niter=%zu %.1f ms\n",
+              n, dim, (size_t)h->ip->graph_degree,
+              (size_t)h->ip->intermediate_graph_degree,
+              (size_t)h->ip->nn_descent_niter, sk_now_ms() - t0);
+    }
+  }
   h->n = n; h->dim = dim;
   return h;
 
@@ -101,9 +133,14 @@ int seekdb_cuvs_serialize(void* handle, const char* filename)
 {
   sk_cuvs_index* index = (sk_cuvs_index*)handle;
   if (!index || !filename) return 1;
+  double t0 = sk_timing() ? sk_now_ms() : 0.0;
   if (cuvsCagraSerialize(index->res, filename, index->idx, true) != CUVS_SUCCESS) {
     fprintf(stderr, "[seekdb_cuvs] serialize failed: %s\n", cuvsGetLastErrorText());
     return 1;
+  }
+  if (sk_timing()) {
+    fprintf(stderr, "[seekdb_cuvs] serialize n=%ld dim=%ld %.1f ms\n",
+            index->n, index->dim, sk_now_ms() - t0);
   }
   return 0;
 }
@@ -116,7 +153,14 @@ void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
   if (cuvsResourcesCreate(&index->res) != CUVS_SUCCESS) goto fail;
   if (cuvsCagraIndexParamsCreate(&index->ip) != CUVS_SUCCESS) goto fail_res;
   if (cuvsCagraIndexCreate(&index->idx) != CUVS_SUCCESS) goto fail_ip;
-  if (cuvsCagraDeserialize(index->res, filename, index->idx) != CUVS_SUCCESS) goto fail_idx;
+  {
+    double t0 = sk_timing() ? sk_now_ms() : 0.0;
+    if (cuvsCagraDeserialize(index->res, filename, index->idx) != CUVS_SUCCESS) goto fail_idx;
+    if (sk_timing()) {
+      fprintf(stderr, "[seekdb_cuvs] deserialize n=%ld dim=%ld %.1f ms\n",
+              n, dim, sk_now_ms() - t0);
+    }
+  }
   {
     int64_t actual_n = 0;
     int64_t actual_dim = 0;
