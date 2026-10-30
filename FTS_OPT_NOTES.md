@@ -2038,3 +2038,25 @@ SET SESSION _force_parallel_ddl_dop=12;
 | tokdump | 80018 行，`d620a35c914c3b1c7c15ca36337a7208` |
 
 注：`/work/seekdb.dop8` 是「并行度 8」的实验二进制（md5 `fd6c6f84...`），**不要当出货版本**。
+
+## 40. 第三十二轮：sstable 压缩算法 —— `none` 更慢，默认 zstd 是对的（负结果）
+
+§39 的尾巴采样里 `ObMacroBlockWriter` 占 40~53%（含 `crc64_sse42` 6.6% self、`memmove` 3.3%），
+所以顺手试了「把默认压缩关掉」能否让写入变快。`default_compress_func` 默认 `zstd_1.3.8`。
+
+**操作限制**：`--parameter <name>` 只接受编译期白名单里的参数
+（`px_task_size` 可以，`default_compress_func`、`syslog_level` 会直接
+`unrecognized option` 起不来），这类参数必须用 `ALTER SYSTEM SET` 在运行时改。
+表与索引由 bench 脚本重建（`skip_load=0`），所以改完默认值再整跑一轮即刻生效。
+
+| 压缩 | build_ik_all | build_ik_content | build_beng_en | tokenize_ik | query_cn |
+| --- | --- | --- | --- | --- | --- |
+| `none` | 3.486 s | 2.889 s | 1.632 s | 0.2490 ms | 1.7807 ms |
+| `zstd_1.3.8`（默认） | **3.363 s** | **2.736 s** | **1.459 s** | **0.2339 ms** | **1.7307 ms** |
+
+关掉压缩**全面变慢 3~8%**（三个 build 指标 + tokenize + query 同向）。
+原因不难理解：不压缩后微块/宏块变大，写入侧 `memmove` 与落盘字节数上升，
+读数时也失去「压缩块小、cache 友好」的好处。
+
+判定：**保持默认 `zstd_1.3.8`，不做改动**（本轮只是排除这个方向，没有提交代码）。
+单个 bin 的绝对值有 ±5% 噪声，但五项指标同向，方向可信。
