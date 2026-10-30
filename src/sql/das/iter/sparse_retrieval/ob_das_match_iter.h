@@ -98,6 +98,7 @@ private:
   common::ObDatumCmpFuncType cmp_func_;
   const ObFixedArray<ObDocIdExt, ObIAllocator> *iter_ids_;
   const common::ObDatumAccessContext *datum_access_ctx_;
+  bool is_fixed_binary_doc_id_;
   bool is_inited_;
 };
 

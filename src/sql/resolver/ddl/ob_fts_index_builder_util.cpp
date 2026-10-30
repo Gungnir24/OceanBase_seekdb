@@ -906,11 +906,34 @@ int ObFtsIndexBuilderUtil::adjust_fts_arg(
                                                 allocator))) {
         }
       } else if (is_doc_word) {
+        ObSEArray<const ObColumnSchemaV2 *, 4> doc_word_cols;
+        const ObColumnSchemaV2 *rowkey_col = nullptr;
+        uint64_t rowkey_col_id = OB_INVALID_ID;
+        const ObIArray<const ObColumnSchemaV2 *> *adjusted_cols = &fts_cols;
+        bool use_rowkey = false;
+        if (!data_schema.is_partitioned_table()
+            && data_schema.is_user_table()
+            && 1 == data_schema.get_rowkey_info().get_size()
+            && OB_SUCC(data_schema.get_rowkey_info().get_column_id(0, rowkey_col_id))
+            && OB_NOT_NULL(rowkey_col = data_schema.get_column_schema(rowkey_col_id))) {
+          use_rowkey = rowkey_col->is_autoincrement()
+              && ob_is_integer_type(rowkey_col->get_data_type());
+        }
         if (OB_FAIL(ret)) {
-        } else if (OB_FAIL(inner_adjust_fts_arg(index_arg,
-                                                fts_cols,
-                                                OB_FTS_DOC_WORD_TABLE_INDEX_COL_CNT,
-                                                allocator))) {
+        } else if (use_rowkey
+                   && (OB_FAIL(doc_word_cols.push_back(rowkey_col))
+                       || OB_FAIL(doc_word_cols.push_back(fts_cols.at(1)))
+                       || OB_FAIL(doc_word_cols.push_back(fts_cols.at(2)))
+                       || OB_FAIL(doc_word_cols.push_back(fts_cols.at(3))))) {
+        } else {
+          if (use_rowkey) {
+            adjusted_cols = &doc_word_cols;
+          }
+          if (OB_FAIL(inner_adjust_fts_arg(index_arg,
+                                           *adjusted_cols,
+                                           OB_FTS_DOC_WORD_TABLE_INDEX_COL_CNT,
+                                           allocator))) {
+          }
         }
       }
     }

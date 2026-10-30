@@ -79,7 +79,8 @@ public:
       doc_word_tablet_id_(),
       snapshot_(),
       doc_word_schema_version_(),
-      doc_word_found_(false)
+      doc_word_found_(false),
+      doc_word_uses_base_rowkey_(false)
   {}
   ~ObFTDocWordInfo() = default;
 
@@ -91,6 +92,7 @@ public:
     doc_word_tablet_id_ = src.doc_word_tablet_id_;
     doc_word_schema_version_ = src.doc_word_schema_version_;
     doc_word_found_ = src.doc_word_found_;
+    doc_word_uses_base_rowkey_ = src.doc_word_uses_base_rowkey_;
 
     if (OB_FAIL(snapshot_.assign(src.snapshot_))) {
     }
@@ -102,7 +104,8 @@ public:
                K_(doc_word_tablet_id),
                K_(snapshot),
                K_(doc_word_schema_version),
-               K_(doc_word_found));
+               K_(doc_word_found),
+               K_(doc_word_uses_base_rowkey));
 public:
   uint64_t table_id_;
   uint64_t doc_word_table_id_;
@@ -110,6 +113,7 @@ public:
   transaction::ObTxReadSnapshot snapshot_;
   int64_t doc_word_schema_version_;
   bool doc_word_found_;
+  bool doc_word_uses_base_rowkey_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObFTDocWordInfo);
@@ -384,9 +388,13 @@ protected:
                                    ObDatum &doc_id_datum,
                                    ObString &ft,
                                    common::ObObjMeta &ft_meta);
+  int get_doc_id_datum(const ObChunkDatumStore::StoredRow *store_row,
+                       ObDatum &doc_id_datum) const;
   int generate_ft_word_rows(const ObChunkDatumStore::StoredRow *store_row);
   int scan_ft_word_rows(const ObChunkDatumStore::StoredRow *store_row);
-  int build_ft_word_row(blocksstable::ObDatumRow *src_row, blocksstable::ObDatumRow *&dest_row);
+  int build_ft_word_row(blocksstable::ObDatumRow *src_row,
+                        blocksstable::ObDatumRow *&dest_row,
+                        const ObDatum *doc_id_override);
 
 private:
   const ObFTDocWordInfo *doc_word_info_;

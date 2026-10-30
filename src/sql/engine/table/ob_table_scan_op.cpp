@@ -3699,7 +3699,13 @@ int ObTableScanOp::fill_generated_fts_cols(blocksstable::ObDatumRow *row)
       } else {
         ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
         ObEvalInfo &eval_info = expr->get_eval_info(eval_ctx_);
-        if (OB_FAIL(datum.from_storage_datum(row->storage_datums_[i], types[i]))) {
+        ObObjDatumMapType type = types[i];
+        if (ob_is_integer_type(expr->datum_meta_.get_type())) {
+          type = OBJ_DATUM_8BYTE_DATA;
+        } else if (ob_is_string_tc(expr->datum_meta_.get_type())) {
+          type = OBJ_DATUM_STRING;
+        }
+        if (OB_FAIL(datum.from_storage_datum(row->storage_datums_[i], type))) {
         } else {
           eval_info.evaluated_ = true;
           eval_info.projected_ = true;

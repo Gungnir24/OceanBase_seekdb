@@ -70,6 +70,7 @@ private:
   storage::ObTableScanParam scan_param_;
   common::ObNewRowIterator *doc_word_iter_;
   ObDocIDType docid_type_;
+  common::ObObjMeta docid_meta_;
   bool is_inited_;
 
   DISALLOW_COPY_AND_ASSIGN(ObFTDocWordScanIterator);

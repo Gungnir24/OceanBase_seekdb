@@ -27,6 +27,7 @@ namespace storage
 ObSRMergeCmp::ObSRMergeCmp()
   : cmp_func_(nullptr),
     iter_ids_data_(nullptr),
+    is_fixed_binary_doc_id_(false),
     is_inited_(false)
 {
 }
@@ -40,6 +41,8 @@ int ObSRMergeCmp::init(
     ret = OB_ERR_UNEXPECTED;
   } else {
     iter_ids_data_ = iter_ids->get_data();
+    is_fixed_binary_doc_id_ = id_meta.type_ == ObVarcharType
+        && id_meta.cs_type_ == CS_TYPE_BINARY;
     common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(id_meta.type_, id_meta.cs_type_);
     cmp_func_ = basic_funcs->null_first_cmp_;
     if (OB_ISNULL(cmp_func_)) {
@@ -63,12 +66,19 @@ int ObSRMergeCmp::cmp(
     ret = OB_ERR_UNEXPECTED;
   } else {
     int tmp_ret = 0;
+    const ObDatum &left = *iter_ids_data_[l.iter_idx_];
+    const ObDatum &right = *iter_ids_data_[r.iter_idx_];
+    if (is_fixed_binary_doc_id_
+        && OB_LIKELY(!left.is_null() && !right.is_null()
+                     && OB_DOC_ID_COLUMN_BYTE_LENGTH == left.len_
+                     && left.len_ == right.len_)) {
+      tmp_ret = MEMCMP(left.ptr_, right.ptr_, OB_DOC_ID_COLUMN_BYTE_LENGTH);
+    } else if (OB_FAIL(cmp_func_(left, right, tmp_ret, nullptr))) {
+    }
     // The dimension iterators keep their domain id datum at a stable address and the pointer array
     // does not change after init(), so read the two datums straight from the raw array instead of
     // going through a non inlined accessor twice per comparison.
-    if (OB_FAIL(cmp_func_(
-            *iter_ids_data_[l.iter_idx_], *iter_ids_data_[r.iter_idx_], tmp_ret, nullptr))) {
-    } else {
+    if (OB_SUCC(ret)) {
       cmp_ret = tmp_ret;
     }
   }

@@ -36,6 +36,7 @@ ObIRIterLoserTreeItem::ObIRIterLoserTreeItem()
 
 ObIRIterLoserTreeCmp::ObIRIterLoserTreeCmp()
   : cmp_func_(), iter_doc_ids_(nullptr), datum_access_ctx_(nullptr),
+    is_fixed_binary_doc_id_(false),
     is_inited_(false)
 {
 }
@@ -55,6 +56,8 @@ int ObIRIterLoserTreeCmp::init(
   } else {
     iter_doc_ids_ = iter_doc_ids;
     datum_access_ctx_ = datum_access_ctx;
+    is_fixed_binary_doc_id_ = doc_id_meta.type_ == ObVarcharType
+        && doc_id_meta.cs_type_ == CS_TYPE_BINARY;
     common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(doc_id_meta.type_, doc_id_meta.cs_type_);
     cmp_func_ = basic_funcs->null_first_cmp_;
     if (OB_ISNULL(cmp_func_)) {
@@ -76,11 +79,16 @@ int ObIRIterLoserTreeCmp::cmp(
     ret = OB_NOT_INIT;
   } else {
     int tmp_ret = 0;
-    if (OB_FAIL(cmp_func_(
-            iter_doc_ids_->at(l.iter_idx_).get_datum(),
-            iter_doc_ids_->at(r.iter_idx_).get_datum(), tmp_ret,
-            datum_access_ctx_))) {
-    } else {
+    const ObDatum &left = iter_doc_ids_->at(l.iter_idx_).get_datum();
+    const ObDatum &right = iter_doc_ids_->at(r.iter_idx_).get_datum();
+    if (is_fixed_binary_doc_id_
+        && OB_LIKELY(!left.is_null() && !right.is_null()
+                     && OB_DOC_ID_COLUMN_BYTE_LENGTH == left.len_
+                     && left.len_ == right.len_)) {
+      tmp_ret = MEMCMP(left.ptr_, right.ptr_, OB_DOC_ID_COLUMN_BYTE_LENGTH);
+    } else if (OB_FAIL(cmp_func_(left, right, tmp_ret, datum_access_ctx_))) {
+    }
+    if (OB_SUCC(ret)) {
       cmp_ret = tmp_ret;
     }
   }

@@ -35,6 +35,7 @@ ObFTDocWordScanIterator::ObFTDocWordScanIterator()
     scan_param_(),
     doc_word_iter_(nullptr),
     docid_type_(ObDocIDType::INVALID),
+    docid_meta_(),
     is_inited_(false)
 {
 }
@@ -74,6 +75,7 @@ void ObFTDocWordScanIterator::reset()
   // remains part of table_param_ after reset and is reused by the next scan,
   // so allocator_ must live until table_param_ is destroyed.
   scan_allocator_.reset();
+  docid_meta_.reset();
   is_inited_ = false;
 }
 
@@ -221,6 +223,14 @@ int ObFTDocWordScanIterator::build_table_param(
       if (ret == OB_ERR_INDEX_KEY_NOT_FOUND) {
         ret = OB_SUCCESS;
         docid_type_ = ObDocIDType::HIDDEN_INC_PK;
+        const ObColumnSchemaV2 *docid_column = column_ids.empty()
+            ? nullptr
+            : table_schema->get_column_schema(column_ids.at(0));
+        if (OB_ISNULL(docid_column)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          docid_meta_ = docid_column->get_meta_type();
+        }
       } else {
       }
     } else {
@@ -244,8 +254,13 @@ int ObFTDocWordScanIterator::build_key_range(const uint64_t table_id,
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
     if (docid_type_ == ObDocIDType::HIDDEN_INC_PK) {
-      objs[0].set_uint64(doc_id_datum.get_uint64());
-      objs[2].set_uint64(doc_id_datum.get_uint64());
+      if (docid_meta_.is_unsigned_integer()) {
+        objs[0].set_uint64(doc_id_datum.get_uint64());
+        objs[2].set_uint64(doc_id_datum.get_uint64());
+      } else {
+        objs[0].set_int(doc_id_datum.get_int());
+        objs[2].set_int(doc_id_datum.get_int());
+      }
     } else if (docid_type_ == ObDocIDType::TABLET_SEQUENCE) {
       objs[0].set_varbinary(doc_id_datum.get_string());
       objs[2].set_varbinary(doc_id_datum.get_string());

@@ -53,6 +53,7 @@ private:
   // after init() and its elements are the dimension iterators' own datum slots, so reading it directly
   // keeps the comparator from paying a non inlined accessor (twice) on every merge heap comparison.
   const ObDatum *const *iter_ids_data_;
+  bool is_fixed_binary_doc_id_;
   bool is_inited_;
 };
 

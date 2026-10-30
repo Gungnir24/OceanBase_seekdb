@@ -240,6 +240,9 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
       doc_word_info.doc_word_tablet_id_ = related_tablet_ids.at(i);
       doc_word_info.doc_word_schema_version_ = related_ctdef->table_param_.get_data_table().get_schema_version();
       doc_word_info.doc_word_found_ = true;
+      doc_word_info.doc_word_uses_base_rowkey_ =
+          related_ctdef->column_types_.count() > 0
+          && ob_is_integer_type(related_ctdef->column_types_.at(0).get_type());
     } else if (related_ctdef->table_param_.get_data_table().is_fts_index_aux()) {
       doc_word_info.table_id_ = related_ctdef->table_param_.get_data_table().get_table_id();
       doc_word_info.doc_word_found_ = false;
@@ -259,6 +262,9 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
           doc_word_info.doc_word_tablet_id_ = related_tablet_ids.at(j);
           doc_word_info.doc_word_schema_version_ = doc_word_related_ctdef->table_param_.get_data_table().get_schema_version();
           doc_word_info.doc_word_found_ = true;
+          doc_word_info.doc_word_uses_base_rowkey_ =
+              doc_word_related_ctdef->column_types_.count() > 0
+              && ob_is_integer_type(doc_word_related_ctdef->column_types_.at(0).get_type());
         }
       }
       if (OB_SUCC(ret) && !doc_word_info.doc_word_found_ && !is_main_table_in_fts_ddl) {
@@ -1043,17 +1049,19 @@ int ObFTDMLIterator::generate_ft_word_rows(const ObChunkDatumStore::StoredRow *s
 int ObFTDMLIterator::scan_ft_word_rows(const ObChunkDatumStore::StoredRow *store_row)
 {
   int ret = OB_SUCCESS;
-  uint64_t doc_id_col_id = OB_INVALID_ID; // get to check
-  ObDocIDType type;
-  if (OB_FAIL(das_ctdef_->table_param_.get_data_table().get_typed_doc_id_col_id(doc_id_col_id, type))) {
-  } else if (OB_UNLIKELY(OB_INVALID_ID == doc_id_col_id)) {
-    ret = OB_INVALID_ARGUMENT;
+  ObDatum doc_id_datum;
+  ObDatum target_doc_id;
+  if (OB_NOT_NULL(doc_word_info_) && doc_word_info_->doc_word_uses_base_rowkey_) {
+    if (OB_ISNULL(store_row) || OB_UNLIKELY(store_row->cnt_ <= 0)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      doc_id_datum = store_row->cells()[0];
+    }
+  } else if (OB_FAIL(get_doc_id_datum(store_row, doc_id_datum))) {
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(get_doc_id_datum(store_row, target_doc_id))) {
   } else {
-    const bool is_fts_index_aux = das_ctdef_->table_param_.get_data_table().is_fts_index_aux();
-    const int64_t doc_id_idx = !is_fts_index_aux ? 0 : 1;
-
-    ObDatum doc_id_datum = store_row->cells()[row_projector_->at(doc_id_idx)];
-
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(data_plane::scan_ft_doc_words(
                    ft_doc_word_iter_, doc_word_info_->doc_word_table_id_, doc_id_datum))) {
@@ -1066,7 +1074,7 @@ int ObFTDMLIterator::scan_ft_word_rows(const ObChunkDatumStore::StoredRow *store
         if (OB_FAIL(data_plane::next_ft_doc_word(ft_doc_word_iter_, row))) {
           if (OB_ITER_END != ret) {
           }
-        } else if (OB_FAIL(build_ft_word_row(row, ft_word_row))) {
+        } else if (OB_FAIL(build_ft_word_row(row, ft_word_row, &target_doc_id))) {
         } else if (OB_FAIL(tmp_rows.push_back(ft_word_row))) {
         } else {
         }
@@ -1154,7 +1162,8 @@ int ObFTDMLIterator::scan_ft_word_rows(const ObChunkDatumStore::StoredRow *store
 
 int ObFTDMLIterator::build_ft_word_row(
     blocksstable::ObDatumRow *src_row,
-    blocksstable::ObDatumRow *&dest_row)
+    blocksstable::ObDatumRow *&dest_row,
+    const ObDatum *doc_id_override)
 {
   int ret = OB_SUCCESS;
   const int64_t DOC_ID_IDX = das_ctdef_->table_param_.get_data_table().is_fts_index_aux() ? 1 : 0;
@@ -1163,6 +1172,12 @@ int ObFTDMLIterator::build_ft_word_row(
   static int64_t DOC_LENGTH_IDX = 3;
   void *buf = nullptr;
   blocksstable::ObDatumRow *tmp_row = nullptr;
+  blocksstable::ObStorageDatum override_doc_id;
+  const blocksstable::ObStorageDatum *src_doc_id = nullptr;
+  if (OB_NOT_NULL(doc_id_override)) {
+    override_doc_id.shallow_copy_from_datum(*doc_id_override);
+    src_doc_id = &override_doc_id;
+  }
   if (OB_ISNULL(src_row)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_UNLIKELY(4 != src_row->count_)) {
@@ -1172,7 +1187,9 @@ int ObFTDMLIterator::build_ft_word_row(
   } else if (FALSE_IT(tmp_row = new (buf) blocksstable::ObDatumRow())) {
   } else if (OB_FAIL(tmp_row->init(src_row->count_))) {
   } else if (OB_FAIL(tmp_row->copy_attributes_except_datums(*src_row))) {
-  } else if (OB_FAIL(tmp_row->storage_datums_[DOC_ID_IDX].deep_copy(src_row->storage_datums_[0], allocator_))) {
+  } else if (OB_FAIL(tmp_row->storage_datums_[DOC_ID_IDX].deep_copy(
+                 OB_NOT_NULL(src_doc_id) ? *src_doc_id : src_row->storage_datums_[0],
+                 allocator_))) {
   } else if (OB_FAIL(tmp_row->storage_datums_[WORD_SEGMENT_IDX].deep_copy(src_row->storage_datums_[1], allocator_))) {
   } else if (OB_FAIL(tmp_row->storage_datums_[WORD_COUNT_IDX].deep_copy(src_row->storage_datums_[2], allocator_))) {
   } else if (OB_FAIL(tmp_row->storage_datums_[DOC_LENGTH_IDX].deep_copy(src_row->storage_datums_[3], allocator_))) {
@@ -1193,14 +1210,12 @@ int ObFTDMLIterator::get_ft_and_doc_id(const ObChunkDatumStore::StoredRow *store
     ret = OB_INVALID_ARGUMENT;
   } else {
     const bool is_fts_index_aux = das_ctdef_->table_param_.get_data_table().is_fts_index_aux();
-    const int64_t doc_id_idx = !is_fts_index_aux ? 0 : 1;
     const int64_t ft_idx = !is_fts_index_aux ? 1 : 0;
 
     ft = store_row->cells()[row_projector_->at(ft_idx)].get_string();
     ft_meta = das_ctdef_->column_types_.at(ft_idx);
-    doc_id_datum = store_row->cells()[row_projector_->at(doc_id_idx)];
-
-    if (OB_FAIL(ObTextStringHelper::read_real_string_data(
+    if (OB_FAIL(get_doc_id_datum(store_row, doc_id_datum))) {
+    } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(
                                                           *lob_read_options_,
                                                           &allocator_,
                                                           ft_meta.get_type(),
@@ -1226,14 +1241,11 @@ int ObFTDMLIterator::get_ft_and_doc_id_for_update(const ObChunkDatumStore::Store
     ret = OB_INVALID_ARGUMENT;
   } else {
     const bool is_fts_index_aux = das_ctdef_->table_param_.get_data_table().is_fts_index_aux();
-    const int64_t doc_id_idx = !is_fts_index_aux ? 0 : 1;
     const int64_t ft_idx = !is_fts_index_aux ? 1 : 0;
 
-    doc_id_datum = store_row->cells()[row_projector_->at(doc_id_idx)];
-
-    ft = store_row->cells()[row_projector_->at(ft_idx)].get_string();
-    ft_meta = das_ctdef_->column_types_.at(ft_idx);
-    if (OB_FAIL(ret)) {
+    if (OB_FAIL(get_doc_id_datum(store_row, doc_id_datum))) {
+    } else if (FALSE_IT(ft = store_row->cells()[row_projector_->at(ft_idx)].get_string())) {
+    } else if (FALSE_IT(ft_meta = das_ctdef_->column_types_.at(ft_idx))) {
     } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(
                                                                  *lob_read_options_,
                                                                  &allocator_,
@@ -1242,6 +1254,45 @@ int ObFTDMLIterator::get_ft_and_doc_id_for_update(const ObChunkDatumStore::Store
                                                                  true /* has lob header */,
                                                                  ft))) {
     } else {
+    }
+  }
+  return ret;
+}
+
+int ObFTDMLIterator::get_doc_id_datum(
+    const ObChunkDatumStore::StoredRow *store_row,
+    ObDatum &doc_id_datum) const
+{
+  int ret = OB_SUCCESS;
+  uint64_t doc_id_col_id = OB_INVALID_ID;
+  ObDocIDType doc_id_type = ObDocIDType::INVALID;
+  int64_t column_idx = -1;
+  if (OB_ISNULL(store_row) || OB_ISNULL(row_projector_) || OB_ISNULL(das_ctdef_)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (das_ctdef_->table_param_.get_data_table().is_fts_doc_word_aux()) {
+    if (OB_UNLIKELY(das_ctdef_->column_ids_.empty())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      doc_id_col_id = das_ctdef_->column_ids_.at(0);
+    }
+  } else if (OB_FAIL(das_ctdef_->table_param_.get_data_table().get_typed_doc_id_col_id(
+                 doc_id_col_id, doc_id_type))) {
+  }
+  if (OB_SUCC(ret)) {
+    for (int64_t i = 0; -1 == column_idx && i < das_ctdef_->column_ids_.count(); ++i) {
+      if (doc_id_col_id == das_ctdef_->column_ids_.at(i)) {
+        column_idx = i;
+      }
+    }
+    if (OB_UNLIKELY(column_idx < 0 || column_idx >= row_projector_->count())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      const int64_t store_idx = row_projector_->at(column_idx);
+      if (OB_UNLIKELY(store_idx < 0 || store_idx >= store_row->cnt_)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        doc_id_datum = store_row->cells()[store_idx];
+      }
     }
   }
   return ret;
