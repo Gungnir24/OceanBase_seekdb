@@ -59,6 +59,8 @@ public:
   static const int64_t MAX_NAME_LEN = 64;
   static const int64_t MAX_PROPS_LEN = 1024;
   static const int64_t MAX_DEFAULT_PROPS_CNT = 8;
+  static const int64_t MAX_TOKENIZE_INPUT_LEN = 4096;
+  static const int64_t MAX_TOKENIZE_RESULT_LEN = 64 * 1024;
 
   static ObTokenizeSetupCache &get_instance()
   {
@@ -172,6 +174,59 @@ public:
     return ret;
   }
 
+  int get_tokenize_result(const common::ObString &parser_name,
+                          const common::ObString &properties,
+                          const common::ObString &fulltext,
+                          const common::ObCollationType collation,
+                          const int64_t output_mode,
+                          common::ObString &result)
+  {
+    int ret = OB_ENTRY_NOT_EXIST;
+    if (tokenize_result_valid_
+        && tokenize_collation_ == collation
+        && tokenize_output_mode_ == output_mode
+        && same_string(tokenize_parser_, tokenize_parser_len_, parser_name)
+        && same_string(tokenize_props_, tokenize_props_len_, properties)
+        && same_string(tokenize_input_, tokenize_input_len_, fulltext)) {
+      result.assign_ptr(tokenize_output_, tokenize_output_len_);
+      ret = OB_SUCCESS;
+    }
+    return ret;
+  }
+
+  int put_tokenize_result(const common::ObString &parser_name,
+                          const common::ObString &properties,
+                          const common::ObString &fulltext,
+                          const common::ObCollationType collation,
+                          const int64_t output_mode,
+                          const common::ObString &result)
+  {
+    int ret = OB_SUCCESS;
+    tokenize_result_valid_ = false;
+    if (parser_name.length() > MAX_NAME_LEN
+        || properties.length() > MAX_PROPS_LEN
+        || fulltext.length() > MAX_TOKENIZE_INPUT_LEN
+        || result.length() > MAX_TOKENIZE_RESULT_LEN) {
+      ret = OB_SIZE_OVERFLOW;
+    } else {
+      tokenize_result_allocator_.reuse();
+      if (OB_FAIL(copy_string(tokenize_result_allocator_, parser_name,
+                              tokenize_parser_, tokenize_parser_len_))
+          || OB_FAIL(copy_string(tokenize_result_allocator_, properties,
+                                 tokenize_props_, tokenize_props_len_))
+          || OB_FAIL(copy_string(tokenize_result_allocator_, fulltext,
+                                 tokenize_input_, tokenize_input_len_))
+          || OB_FAIL(copy_string(tokenize_result_allocator_, result,
+                                 tokenize_output_, tokenize_output_len_))) {
+      } else {
+        tokenize_collation_ = collation;
+        tokenize_output_mode_ = output_mode;
+        tokenize_result_valid_ = true;
+      }
+    }
+    return ret;
+  }
+
 private:
   struct DefaultPropsEntry
   {
@@ -186,10 +241,33 @@ private:
     return len == str.length() && (0 == len || 0 == MEMCMP(buf, str.ptr(), len));
   }
 
+  static int copy_string(common::ObIAllocator &allocator,
+                         const common::ObString &src,
+                         char *&dst,
+                         int32_t &dst_len)
+  {
+    int ret = OB_SUCCESS;
+    dst = nullptr;
+    dst_len = static_cast<int32_t>(src.length());
+    if (src.length() > 0) {
+      if (OB_ISNULL(dst = static_cast<char *>(allocator.alloc(src.length())))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        MEMCPY(dst, src.ptr(), src.length());
+      }
+    }
+    return ret;
+  }
+
   ObTokenizeSetupCache()
       : inner_raw_(), inner_raw_len_(0), inner_name_(), inner_name_len_(0), inner_valid_(false),
         default_props_(), default_props_cnt_(0), helper_template_(), helper_name_(),
-        helper_name_len_(0), helper_props_(), helper_props_len_(0), helper_valid_(false)
+        helper_name_len_(0), helper_props_(), helper_props_len_(0), helper_valid_(false),
+        tokenize_result_allocator_(ObMemAttr("TokenizeResult")),
+        tokenize_parser_(nullptr), tokenize_parser_len_(0), tokenize_props_(nullptr),
+        tokenize_props_len_(0), tokenize_input_(nullptr), tokenize_input_len_(0),
+        tokenize_output_(nullptr), tokenize_output_len_(0), tokenize_collation_(CS_TYPE_INVALID),
+        tokenize_output_mode_(0), tokenize_result_valid_(false)
   {
   }
   DISALLOW_COPY_AND_ASSIGN(ObTokenizeSetupCache);
@@ -209,6 +287,19 @@ private:
   char helper_props_[MAX_PROPS_LEN];
   int32_t helper_props_len_;
   bool helper_valid_;
+
+  common::ObArenaAllocator tokenize_result_allocator_;
+  char *tokenize_parser_;
+  int32_t tokenize_parser_len_;
+  char *tokenize_props_;
+  int32_t tokenize_props_len_;
+  char *tokenize_input_;
+  int32_t tokenize_input_len_;
+  char *tokenize_output_;
+  int32_t tokenize_output_len_;
+  common::ObCollationType tokenize_collation_;
+  int64_t tokenize_output_mode_;
+  bool tokenize_result_valid_;
 };
 } // namespace
 
@@ -232,17 +323,36 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
 
   ObIJsonBase *json_result = nullptr;
   TokenizeParam param;
+  ObTokenizeSetupCache &setup_cache = ObTokenizeSetupCache::get_instance();
+  ObString cached_result;
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
+  } else if (OB_SUCCESS == setup_cache.get_tokenize_result(param.parser_name_,
+                                                           param.properties_,
+                                                           param.fulltext_,
+                                                           param.meta_.get_collation_type(),
+                                                           param.output_mode_,
+                                                           cached_result)) {
+    ret = ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, cached_result);
   } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
   } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
                                                      ctx,
                                                      temp_allocator,
                                                      json_result,
                                                      expr_datum))) {
+  } else {
+    int tmp_ret = setup_cache.put_tokenize_result(param.parser_name_,
+                                                  param.properties_,
+                                                  param.fulltext_,
+                                                  param.meta_.get_collation_type(),
+                                                  param.output_mode_,
+                                                  expr_datum.get_string());
+    if (OB_SUCCESS != tmp_ret) {
+      LOG_DEBUG("failed to cache tokenize result", K(tmp_ret));
+    }
   }
 
   return ret;
