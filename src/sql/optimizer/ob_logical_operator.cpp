@@ -3048,9 +3048,75 @@ int ObLogicalOperator::project_pruning_pre()
     if (OB_FAIL(check_output_dependance(table_scan->get_access_exprs(), deps))) {
     } else {
       do_project_pruning(table_scan->get_access_exprs(), deps);
+      bool can_skip_text_access = false;
+      if (table_scan->is_text_retrieval_scan()
+          && !table_scan->has_func_lookup()
+          && !table_scan->has_es_match()
+          && !table_scan->has_merge_fts_index()
+          && !table_scan->is_vec_idx_scan()
+          && NULL != parent_
+          && LOG_SUBPLAN_SCAN == parent_->get_type()
+          && parent_->get_output_exprs().empty()
+          && !table_scan->get_access_exprs().empty()) {
+        bool only_rowkey_access = true;
+        for (int64_t i = 0; only_rowkey_access
+             && i < table_scan->get_access_exprs().count(); ++i) {
+          only_rowkey_access = ObOptimizerUtil::find_item(
+              table_scan->get_rowkey_exprs(), table_scan->get_access_exprs().at(i));
+        }
+        if (only_rowkey_access) {
+          PPDeps parent_deps;
+          PPDeps semantic_deps;
+          ObSEArray<ObRawExpr*, 8> semantic_exprs;
+          ObRawExprCheckDep dep_checker(table_scan->get_access_exprs(), semantic_deps, true);
+          if (OB_FAIL(parent_->check_output_dependance(
+              table_scan->get_access_exprs(), parent_deps))) {
+          } else if (!parent_deps.is_empty()) {
+            // The subplan still uses a projected value.
+          } else if (OB_FAIL(append(semantic_exprs, table_scan->get_filter_exprs()))) {
+          } else if (OB_FAIL(append(semantic_exprs, table_scan->get_pushdown_aggr_exprs()))) {
+          } else if (NULL != table_scan->get_limit_expr()
+              && OB_FAIL(semantic_exprs.push_back(table_scan->get_limit_expr()))) {
+          } else if (NULL != table_scan->get_offset_expr()
+              && OB_FAIL(semantic_exprs.push_back(table_scan->get_offset_expr()))) {
+          } else {
+            for (int64_t i = 0; OB_SUCC(ret) && i < table_scan->get_op_ordering().count(); ++i) {
+              ret = semantic_exprs.push_back(table_scan->get_op_ordering().at(i).expr_);
+            }
+          }
+          if (OB_FAIL(ret)) {
+          } else if (OB_FAIL(dep_checker.check(semantic_exprs))) {
+          } else {
+            can_skip_text_access = semantic_deps.is_empty();
+          }
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (can_skip_text_access) {
+        ObConstRawExpr *dummy_output = NULL;
+        ObOptimizerContext &optimizer_ctx = get_plan()->get_optimizer_context();
+        if (OB_FAIL(ObRawExprUtils::build_const_int_expr(optimizer_ctx.get_expr_factory(),
+                                                         ObIntType,
+                                                         1,
+                                                         dummy_output))) {
+        } else if (OB_ISNULL(dummy_output)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(dummy_output->extract_info())) {
+        } else {
+          table_scan->get_output_exprs().reset();
+          if (OB_FAIL(table_scan->get_output_exprs().push_back(dummy_output))) {
+          } else {
+            ret = optimizer_ctx.get_all_exprs().append(dummy_output);
+          }
+        }
+        if (OB_SUCC(ret)) {
+          table_scan->get_access_exprs().reset();
+          ret = table_scan->index_back_check();
+        }
+      } else {
+        ret = table_scan->index_back_check();
+      }
     }
-    if (OB_SUCC(ret) && OB_FAIL(table_scan->index_back_check())) {
-    } else { /* Do nothing */ }
   } else if (LOG_SUBPLAN_SCAN == type_) {
     ObLogSubPlanScan *subplan_scan = static_cast<ObLogSubPlanScan*>(this);
     PPDeps deps;
