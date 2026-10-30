@@ -1299,3 +1299,81 @@ collect_dims_by_id                                  3.16%
 
 **规则**：判断某函数是不是瓶颈，必须同时看它的 self、它的子树总时间、以及它子节点的占比；
 只看父节点 inclusive 就立项，一定会找错对象。
+
+## 29. 第二十轮：build 侧首次归因 —— 排序规则链占约 14%
+
+按 §28.3 的规则（先看子节点，不看父节点 inclusive），对建索引阶段单独采样：
+循环执行 `ALTER TABLE docs DROP INDEX fti_all_ik` + `ADD FULLTEXT INDEX ... WITH PARSER ik`，
+4 轮，26 秒采样。
+
+### 29.1 inclusive 结构
+
+| 占比 | 符号 |
+| --- | --- |
+| 53.99% | `ObPxMultiPartSSTableInsertOp::inner_get_next_row` |
+| 53.96% | `└ ObPxMultiPartSSTableInsertOp::write_ordered_slice_by_row` |
+| 37.39% | `└ get_next_row_from_child`（从排序算子拉行） |
+| 31.08% | `ObSortOp::process_sort_batch`（排序） |
+
+即建索引 = 54% 写入 SSTable + 31% 排序，**两者都是通用存储/执行框架**。
+
+### 29.2 flat self：排序规则链是最大单点
+
+| 占比 | 符号 |
+| --- | --- |
+| **7.30%** | `ObNullSafeDatumStrCmp<CS_TYPE 45, false, true>::cmp` |
+| **3.54%** | `ob_strnncollsp_utf8mb4` |
+| **3.14%** | `ob_mb_wc_utf8mb4` |
+| 3.15% | `ObOperator::get_next_batch` |
+| 2.75% | `__memcmp_avx2_movbe` |
+| 2.62% | `ObSortOpImpl::Compare::operator()` |
+| 2.08% | `__memmove_avx_unaligned_erms` |
+| 1.73% | `ObChunkDatumStore::Iterator::attach_rows` |
+| 1.43% | `crc64_sse42` |
+| 1.34% + 1.19% | `ZSTD_compressBlock_fast` / `ZSTD_decompressSequences_bmi2` |
+
+**CS_TYPE 45 = utf8mb4_general_ci**，也就是 FTS 索引行的排序键比较：
+`ObNullSafeDatumStrCmp` → `ob_strnncollsp_utf8mb4` → `ob_mb_wc_utf8mb4`，
+这条链合计 **13.98%**，是所有可识别单点里最大的一块。
+
+### 29.3 为什么之前的 ASCII 快路径对它无效
+
+`ob_strnncollsp_utf8mb4` 的主循环逐字符做：
+
+```c
+while (src < se && dst < te) {
+  int s_res = ob_mb_wc_utf8mb4(cs, &src_wc, src, se);   // 3.14%
+  int t_res = ob_mb_wc_utf8mb4(cs, &dst_wc, dst, te);
+  ob_tosort_unicode(uni_plane, &src_wc, cs->state);     // 表查找
+  ob_tosort_unicode(uni_plane, &dst_wc, cs->state);
+  if (src_wc != dst_wc) return src_wc > dst_wc ? 1 : -1;
+  src += s_res; dst += t_res;
+}
+```
+
+`build_ik_all` 的排序键是**中文词**，全部是三字节 UTF-8，根本不进 ASCII 分支——
+这就是 §15 那次「语义等价却零收益」的原因。
+
+### 29.4 下一轮要做的改动（方案已定）
+
+CJK 统一表意文字（U+4E00–U+9FFF，UTF-8 首字节 0xE4–0xE9）在 general_ci 下没有大小写折叠，
+排序权重等于码点本身。因此可以在这个函数里加一条**定长三字节快路径**：
+
+- 当两侧当前字符的首字节都落在 0xE4–0xE9、且都是合法三字节序列时，
+  直接比较这 3 个字节并跳过 `ob_mb_wc_utf8mb4` 与 `ob_tosort_unicode` 共 4 次调用/字符；
+- UTF-8 的字节序等于码点序，所以逐字节比较与逐码点比较等价；
+- 其余情况（ASCII、二字节、四字节、非法序列）一律走原路径，行为完全不变。
+
+预期：吃掉这 14% 的 60~70%，即 `build_ik_all` 提升 8~10%，
+折合 22.2 × 0.09 ≈ **+2 分/指标**，`build_ik_all` 与 `build_ik_content` 两个指标合计约 **+4 分**。
+
+**风险与校验**：这是 `oblib` 里被内核所有字符串比较共用的函数，改错等于静默损坏索引。
+必须做的校验：token dump md5、四个 hits、`ORDER BY` 稳定性对照（同一批 CJK 词在旧/新二进制下排序完全一致）、
+以及建索引两次结果一致。上一轮 ASCII 快路径的验证流程可以直接复用。
+
+**为什么本轮不做**：当前上下文余量不足以完成「实现 + 编译 + 上面四项校验 + 交错 A/B」，
+而这类改动一旦验证不完整就是灾难性的。方案、预期、校验项都已写清，下一轮可直接执行。
+
+### 29.5 状态
+
+未改代码。`fts-final` 仍为 `63fd3f7ca`，代码 devirt8，最近一次官方全流程 `final-e98e23f` 无崩溃。
