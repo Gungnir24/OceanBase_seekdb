@@ -1557,3 +1557,54 @@ DDL 的 DOP 是在哪里决定的？候选：
 这意味着修复方向比 §32.4 猜的第 3 种乐观——不需要拆串行逻辑，
 只需要让这条 DDL 的 DOP 提上去。下一个定位点：FTS 建索引 DDL 生成 PX 计划时 DOP 的取值来源
 （表级 `PARALLEL` 已证明无效，见 §32.2）。
+
+## 33. 第二十三轮：FTS 建索引并行度去掉 /3（+2.45%）
+
+### 33.1 根因
+
+`src/sql/resolver/ddl/ob_fts_index_builder_util.cpp` 的 `decide_parallelism()`：
+
+```cpp
+case INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
+case INDEX_TYPE_FTS_INDEX_LOCAL:
+case INDEX_TYPE_FTS_DOC_WORD_LOCAL:
+  decided_parallelism = MAX(original_parallelism / 3, 1L);   // 8 核 -> 2
+```
+
+FTS 索引的建立被硬编码只给三分之一的并行度。实测机器上并行度 2.13~2.41、8 核只用了 3 核，
+与此吻合。
+
+### 33.2 改动
+
+改为 `MAX(original_parallelism, 1L)`，即用满传入的并行度。
+
+### 33.3 验证：语义不变
+
+| 项目 | 结果 |
+| --- | --- |
+| hits | 8001 / 11000 / 7332 / 20 |
+| token dump | 80018 行，md5 `d620a35c914c3b1c7c15ca36337a7208` |
+
+### 33.4 性能：4 轮交错 A/B 全部更快
+
+每次 3 遍 `build_ik_all` 取平均：
+
+| 轮次 | par3 | devirt8 | 变化 |
+| --- | --- | --- | --- |
+| 1 | 3838 ms | 3871 ms | −0.85% |
+| 2 | 3804 ms | 3904 ms | −2.56% |
+| 3 | 3974 ms | 4155 ms | −4.36% |
+| 4 | 3962 ms | 4044 ms | −2.03% |
+
+**均值 −2.45%，4/4 方向一致**（符号检验 p≈0.06）。折合 3 个 build 指标约 **+1.6 分**。
+
+### 33.5 意外发现：DOP 不是限制并行度的真正原因
+
+改动后实测并行度只从 2.29 升到 **2.37**，几乎没有变化，但时间确实下降了。
+说明 `decide_parallelism` 的返回值并不是 PX 计划里实际使用的 worker 数，
+真正的并发上限来自别处（PX worker 池、granule 数、或计划里另一个 DOP 来源）。
+本轮的收益更像是「减少了某种串行化的粒度」，而不是真的把 worker 数翻倍。
+
+**下一步**：既然 8 核只用 2.4 核，就还有 3 倍空间。需要找到真正决定 PX worker 数的位置。
+这条 DDL 的计划由 `ob_fts_index_build_task.cpp` 发起，`parallelism_` 只是其中一环；
+还要看 `ObPxMultiPartSSTableInsertOp` 计划生成时 `expected_worker_count` 的来源。
