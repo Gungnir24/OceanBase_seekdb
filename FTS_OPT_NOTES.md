@@ -2404,3 +2404,79 @@ slice_idx 顺序拼接**，因此 slice k 的键必须整体小于 slice k+1 的
   §44.1 那次「px256 是脏源编的」很可能也是同一类问题叠加。
 - `docker exec ... bash -c "..."` 在 Windows PowerShell 下会把内层引号吃掉（`-h127.0.0.1` 变成 `127`、
   SQL 只剩 `SELECT`、`$(...)` 报 `unexpected EOF`）。稳妥做法：**把命令写成脚本文件再 `docker cp` 进去跑**。
+
+## 46. word 空间的切分是可行的：实测 8 段最多 17.8%
+
+§45 的结论是「要在 word 空间里切」，这一节先回答「值不值得做、能切多匀」——不用改代码，
+直接从 3000 篇文档的 TOKENIZE 结果统计（104000 个词，37 个不同首字节）：
+
+| 首字节 | 占比 | | 首字节 | 占比 |
+| --- | --- | --- | --- | --- |
+| 0x61 `a` | 2.9% | | 0xe4 | 5.8% |
+| 0x62 `b` | 3.3% | | **0xe5** | **17.8%** |
+| 0x69 `i` | 3.8% | | **0xe6** | **13.0%** |
+| 0x6f `o` | 3.3% | | 0xe7 | 10.1% |
+| 0x72 `r` | 4.1% | | 0xe8 | 2.9% |
+| 0x74 `t` | 5.0% | | 0xe9 | 2.4% |
+
+其余首字节均 ≤2.9%。也就是 ASCII 词摊在 20 多个首字节上、CJK 词集中在 0xE4~0xE9（占 52%）。
+
+**按分位点切的效果（同样是这 104000 个词）**：
+
+| 切段数 | 各段占比 | 最大段 |
+| --- | --- | --- |
+| 4 | 24 700 / 25 300 / 24 500 / 29 500 | **28.4%** |
+| 8 | 11 700 / 13 000 / 11 200 / 14 100 / 6 000 / 18 500 / 13 500 / 16 000 | **17.8%** |
+
+对比现状（word 主导那张表 **100% 落一片**）：切 8 段后最大片 17.8%，
+按 §44.2 的量纲（693k 行独占 1.6~2.6 s），**尾巴有 3~5 倍空间**。这条路值得做。
+
+### 46.1 实现要注意的唯一硬约束：切点必须是「保序」的映射
+
+排序键是 (word, doc_id)，slice 序 = 宏块序，所以「word → 片号」必须**单调不减**
+（`MACRO_BLOCK_SEQ_INTERVAL` 要求 slice k 的键整体小于 slice k+1）。因此：
+
+- ✅ 按 **word 的字节序** 分桶（`bucket = f(word)`，f 单调）是安全的；
+- ❌ 按 hash / 轮转 / doc_id 分片不行（§45.1 已论证）。
+
+**但有一个必须先验证的前提**：word 列用的排序规则。
+`ob_slice_calc.cpp` 的区间比较走 `sort_cmp_funs_` / `sort_collations_`，如果 word 列是
+`utf8mb4_general_ci`，那么大小写是折叠的（`'a'` 与 `'A'` 同权重）——此时按首字节 0x5A/0x61 切
+会把 `a..` 排到 `Z..` 之后，与 ci 序冲突，**不能切**。若 word 列是 `utf8mb4_bin`，字节序 == 排序序，
+可以直接按字节分桶。所以第一步是确认这张表 word 列的 collation（`SHOW CREATE TABLE` 或
+`ob_fts_index_builder_util.cpp` 里 `generate_word_segment_column` 的类型/排序规则）。
+
+### 46.2 建议的落地顺序（下一轮照这个做）
+
+1. 确认 word 列 collation（1 次 SQL，零风险）；
+2. 若是 bin：在 `ObRangeSliceIdCalc` 之外新增一个「按 word 首字节分桶」的 slice 计算
+   （单调映射，桶数 = task_cnt），只对 `INDEX_TYPE_FTS_INDEX_LOCAL` 的 insert op 生效；
+   这样不依赖 RS 的 cut key，也不需要扫数据；
+3. 过三关（hits / tokdump / 交错 A/B），build 至少 −10% 才算赢，否则回退；
+4. 若是 ci：退回「采样分位点做 cut key」那条路（§45.2 方案 1），不能按字节切。
+
+### 46.3 结论：collation 是 `utf8mb4_general_ci`，按字节分桶这条路被堵死
+
+`show create table docs` / `information_schema.columns`：
+
+```
+`content` text NOT NULL → collation_name = utf8mb4_general_ci
+```
+
+而生成的 word 列**继承被分词列的 collation**（`ob_fts_index_builder_util.cpp:1129-1137,1161`
+`set_collation_type(collation_type)`，多列 collation 不一致还会直接 `OB_NOT_SUPPORTED`）。
+所以 word 列也是 `utf8mb4_general_ci` → 大小写折叠（`'a'`/`'A'` 同权重），
+**按首字节 0x5A/0x61 切会把 `a..` 排到 `Z..` 后面，与 ci 序冲突**，§46.1 里「若是 bin 就按字节分桶」
+的快捷方案不成立。
+
+剩下唯一正确的做法是 **ci 序下的分位点切分**：需要一份 word 的采样（或一次轻量统计）算出 ci 序分位点，
+把这些点作为 DDL 的 `range_cut_` 传给 producer。工作量和 §45.2 方案 1 一样，是「改 RS/DDL 侧 + 采样」的规模，
+不是几行能收口的。
+
+本轮到此为止的净结论（供后续接续）：
+
+- 靶点已从「drain 不并行」精确收敛到「word 主导那张索引表 100% 落在一个 slice，因为 doc 区间的
+  cut key 对 word 没有区分度」；
+- 收益上限已量化：8 段分位切 → 最大片 17.8%（现状 100%），尾巴有 3~5 倍空间；
+- 正确性约束已搞清：切点必须单调（`MACRO_BLOCK_SEQ_INTERVAL`），且必须按 **ci 序**而不是字节序；
+- 因此实现形态固定为「采样 + ci 序分位点 → DDL range_cut_」，没有更便宜的捷径。
