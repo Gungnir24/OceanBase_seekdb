@@ -1537,3 +1537,23 @@ DDL 的 DOP 是在哪里决定的？候选：
 `SCALAR GROUP BY → TEXT RETRIEVAL SCAN`，且都带 `calc_relevance=true`；
 `query_limit` 还额外带 `sort_keys([MATCH(...) DESC]), limit(20)` 与 `is_index_back=true`。
 相关性剥离已在 §17 测过是持平，这里不再重复。
+
+### 32.6 追加：worker 不是被卡住，是 DOP 不够
+
+对建索引的采样做阻塞分析，内核侧的等待符号几乎为零：
+
+| 占比 | 符号 |
+| --- | --- |
+| 0.54% | `ObCompactBlockWriter::inner_process_datum` |
+| 0.49% | `ObCompactBlockWriter::ensure_write` |
+| 0.38% | `pthread_spin_lock` |
+| 0.35% | `ObMacroBlockWriter::save_last_key` |
+
+**没有 futex / 条件变量 / IO 等待**，`pthread_spin_lock` 只有 0.38%。
+也就是说 5 个 PX worker 都在真正做计算（self 时间集中在排序比较 7.30%、
+字符集 3.54%+3.14%、`get_next_batch` 3.15%），并不是在等锁或在等写盘。
+
+结论修正：**低并行度的原因是 DOP/分片数不够，不是串行点阻塞**。
+这意味着修复方向比 §32.4 猜的第 3 种乐观——不需要拆串行逻辑，
+只需要让这条 DDL 的 DOP 提上去。下一个定位点：FTS 建索引 DDL 生成 PX 计划时 DOP 的取值来源
+（表级 `PARALLEL` 已证明无效，见 §32.2）。
