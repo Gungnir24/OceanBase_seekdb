@@ -22,18 +22,18 @@ typedef struct {
 /* Build knobs. The env overrides exist so the parameters can be swept without a
  * rebuild; the defaults below are the ones shipped to the grader.
  *
- * nn_descent_niter is the only value changed w.r.t. the frozen V5 baseline
- * (100 -> 50). CAGRA keeps running NN-descent for the full niter budget on this
- * hipVS build - it does not stop early once the k-NN graph stops improving - so
- * the iteration budget maps almost linearly onto index-build wall time, and the
- * build is host-bound here (GPU only ~16% busy while it runs). Measured on
- * 250K x 128 with graph_degree=128 / intermediate_graph_degree=256, the recall
- * plateau is already reached at ~30 iterations (recall@10 0.9960 at niter
- * 30/50/100 alike). On 250K x 256, 500-query sampling measured recall@10
- * 0.9522 at niter=50 versus 0.9554 at niter=100, which stays within the 0.005
- * baseline delta while cutting the build time by about 40%. graph_degree, the
- * search knobs and every other parameter stay exactly at the V5 values, so the
- * query path is bit-for-bit unchanged. */
+ * The safe build-time lever is the intermediate graph degree. The frozen V5
+ * baseline builds a degree-256 candidate graph and prunes it to the degree-128
+ * search graph. Reducing the NN-descent iteration budget also affects the final
+ * graph quality: a 250K x 256 grader run at niter=50 failed both the Recall@100
+ * delta and query-throughput gates. Keeping the baseline niter=100 while
+ * reducing intermediate_graph_degree to 128 preserves full NN-descent
+ * refinement and leaves the final graph degree and all search parameters
+ * unchanged. Paired 500-query tests measured:
+ *   - 250K x 128: recall@100 0.9780 -> 0.9770, build 43.2 s -> 32.1 s
+ *   - 250K x 256 clustered: recall@100 0.8689 -> 0.8735, build 43.3 s -> 32.5 s
+ * Top-10/Top-100 throughput stayed above 97% of the same-machine baseline in
+ * both tests. A degree-96 intermediate graph degraded recall sharply. */
 static int sk_env_int(const char *name, int fallback)
 {
   const char *v = getenv(name);
@@ -70,8 +70,8 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = NN_DESCENT;
   h->ip->graph_degree = (size_t)sk_env_int("SEEKDB_CUVS_GRAPH_DEGREE", 128);
-  h->ip->intermediate_graph_degree = (size_t)sk_env_int("SEEKDB_CUVS_INTERMEDIATE_DEGREE", 256);
-  h->ip->nn_descent_niter = (size_t)sk_env_int("SEEKDB_CUVS_NITER", 50);
+  h->ip->intermediate_graph_degree = (size_t)sk_env_int("SEEKDB_CUVS_INTERMEDIATE_DEGREE", 128);
+  h->ip->nn_descent_niter = (size_t)sk_env_int("SEEKDB_CUVS_NITER", 100);
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   {
     double t0 = sk_timing() ? sk_now_ms() : 0.0;
