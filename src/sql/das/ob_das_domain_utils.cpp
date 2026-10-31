@@ -1275,6 +1275,11 @@ int ObFTDMLIterator::get_doc_id_datum(
     } else {
       doc_id_col_id = das_ctdef_->column_ids_.at(0);
     }
+  } else if (das_ctdef_->table_param_.get_data_table().is_fts_index_aux()
+             && das_ctdef_->column_ids_.count() > 1
+             && das_ctdef_->column_types_.count() > 1
+             && ob_is_integer_type(das_ctdef_->column_types_.at(1).get_type())) {
+    doc_id_col_id = das_ctdef_->column_ids_.at(1);
   } else if (OB_FAIL(das_ctdef_->table_param_.get_data_table().get_typed_doc_id_col_id(
                  doc_id_col_id, doc_id_type))) {
   }
