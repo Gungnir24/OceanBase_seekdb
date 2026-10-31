@@ -382,7 +382,22 @@ static int ob_strnncollsp_utf8mb4(const ObCharsetInfo *cs,
   const unsigned char *se= src + srclen, *te= dst + dstlen;
   ObUnicaseInfo *uni_plane= cs->caseinfo;
   while ( src < se && dst < te ) {
-    int s_res= ob_mb_wc_utf8mb4(cs, &src_wc, src, se);
+    int s_res = 0;
+    if (src[0] == dst[0]) {
+      s_res = ob_mb_wc_utf8mb4(cs, &src_wc, src, se);
+      if (s_res <= 0) {
+        return bincmp_utf8mb4(src, se, dst, te);
+      } else if (static_cast<size_t>(s_res) <= static_cast<size_t>(te - dst)
+                 && 0 == memcmp(src, dst, s_res)) {
+        // Identical code points have identical collation weights.
+        src += s_res;
+        dst += s_res;
+        continue;
+      }
+    }
+    if (0 == s_res) {
+      s_res = ob_mb_wc_utf8mb4(cs, &src_wc, src, se);
+    }
     int t_res= ob_mb_wc_utf8mb4(cs, &dst_wc, dst, te);
     if ( s_res <= 0 || t_res <= 0 ) {
       return bincmp_utf8mb4(src, se, dst, te);

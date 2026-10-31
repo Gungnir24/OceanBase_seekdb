@@ -387,6 +387,14 @@ struct ObDatumStrCmp : public ObDefined<SupportedCollection<CS_TYPE>::defined_>
 {
   inline static int cmp(const ObDatum &l, const ObDatum &r, int &cmp_ret)
   {
+    // Collation can only map identical byte strings to the same weight.
+    if (CS_TYPE != CS_TYPE_BINARY
+        && OB_LIKELY(nullptr != l.ptr_ && nullptr != r.ptr_)
+        && OB_LIKELY(l.len_ == r.len_)
+        && OB_LIKELY(l.ptr_ == r.ptr_ || 0 == MEMCMP(l.ptr_, r.ptr_, l.len_))) {
+      cmp_ret = 0;
+      return OB_SUCCESS;
+    }
     // Fast path for the common case: resolve the collation handler once per
     // instantiation instead of on every comparison, so the hot path is a
     // single indirect call into the collation routine.
