@@ -14,6 +14,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -276,14 +277,66 @@ def stop_process_group(process):
         return True
 
 
+def ensure_vectors_tsv(dataset, ids, base):
+    """Reuse only a source-bound TSV with its own verified content hash.
+
+    Generation, integrity checking and atomic replacement are outside scored
+    DDL timing. A crash between the two renames forces a rebuild next time.
+    """
+    data_file, metadata_file = dataset / "vectors.tsv", dataset / "vectors.tsv.meta.json"
+    manifest = json.loads((dataset / "manifest.json").read_text())
+    binding = {"version": 1, "rows": len(base), "dim": base.shape[1], "source_hashes": {}}
+    for name in ("base.npy", "ids.npy"):
+        expected = manifest.get("hashes", {}).get(name)
+        if not expected or sha256(dataset / name) != expected:
+            raise ValueError("Cannot bind TSV cache to an unverified source: " + name)
+        binding["source_hashes"][name] = expected
+    if len(ids) != len(base):
+        raise ValueError("TSV source ID/vector row counts differ")
+    try:
+        cached = json.loads(metadata_file.read_text())
+        if (isinstance(cached, dict) and all(cached.get(key) == value for key, value in binding.items())
+                and data_file.is_file() and cached.get("bytes") == data_file.stat().st_size
+                and isinstance(cached.get("tsv_sha256"), str)
+                and cached["tsv_sha256"] == sha256(data_file)):
+            return data_file
+    except (OSError, ValueError, TypeError):
+        pass
+    temporary = metadata_temporary = None
+    try:
+        digest, byte_count = hashlib.sha256(), 0
+        fd, name = tempfile.mkstemp(prefix=".vectors.", suffix=".tsv.tmp", dir=dataset)
+        temporary = Path(name)
+        with os.fdopen(fd, "w", encoding="ascii", newline="\n") as stream:
+            for index, vector in zip(ids, base):
+                line = f"{int(index)}\t{literal(vector)}\n"
+                payload = line.encode("ascii")
+                stream.write(line)
+                digest.update(payload)
+                byte_count += len(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        metadata = dict(binding, bytes=byte_count, tsv_sha256=digest.hexdigest())
+        fd, name = tempfile.mkstemp(prefix=".vectors.", suffix=".json.tmp", dir=dataset)
+        metadata_temporary = Path(name)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(metadata, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, data_file)
+        os.replace(metadata_temporary, metadata_file)
+    finally:
+        for path in (temporary, metadata_temporary):
+            if path is not None:
+                path.unlink(missing_ok=True)
+    return data_file
+
+
 def import_vectors(connection, args, ids, base):
     if args.import_mode == "load-data":
         # File is visible to this server; do not silently fall back to INSERT.
-        data_file = args.dataset / "vectors.tsv"
-        if not data_file.exists():
-            with data_file.open("w", encoding="ascii", newline="\n") as stream:
-                for index, vector in zip(ids, base):
-                    stream.write(f"{int(index)}\t{literal(vector)}\n")
+        data_file = ensure_vectors_tsv(args.dataset, ids, base)
         sql(connection, "LOAD DATA INFILE %s INTO TABLE items "
                         "FIELDS TERMINATED BY '\\t' LINES TERMINATED BY '\\n' (id,v)",
             (str(data_file.resolve()),))

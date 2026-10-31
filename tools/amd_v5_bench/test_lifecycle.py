@@ -26,16 +26,18 @@ class LifecycleHelpersTest(unittest.TestCase):
     def test_query_integrity_and_recall(self):
         truth = np.arange(7, 307, 3, dtype=np.int64)[None, :]
         valid = set(map(int, truth[0]))
+        base = np.column_stack((np.arange(1, 101), np.zeros(100))).astype(np.float32)
+        kwargs = dict(base=base, ids=truth[0], query_vectors=np.zeros((1, 2), dtype=np.float32), profile="sift")
         def fake_sql(connection, statement, values):
             k = 100 if statement.endswith("100") else 10
-            return [(int(value),) for value in truth[0, :k]]
+            return [(int(value), float(index + 1)) for index, value in enumerate(truth[0, :k])]
         with patch("lifecycle_check.sql", fake_sql):
-            metrics = query_checks(None, "items", ["[0,0]"], truth, valid)
+            metrics = query_checks(None, "items", ["[0,0]"], truth, valid, **kwargs)
         self.assertEqual(metrics["recall_at_10"], 1.0)
         self.assertEqual(metrics["recall_at_100"], 1.0)
         with patch("lifecycle_check.sql", return_value=[(7,)]):
             with self.assertRaises(ValueError):
-                query_checks(None, "items", ["[0,0]"], truth, valid)
+                query_checks(None, "items", ["[0,0]"], truth, valid, **kwargs)
 
 
 if __name__ == "__main__":

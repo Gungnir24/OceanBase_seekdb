@@ -1,5 +1,5 @@
-#ifndef SEEKDB_CUVS_BRIDGE_H
-#define SEEKDB_CUVS_BRIDGE_H
+#pragma once
+#include <stddef.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -25,7 +25,15 @@ int   seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
 void  seekdb_cuvs_free(void* handle);
 int seekdb_cuvs_serialize(void* handle, const char* filename);
 void* seekdb_cuvs_deserialize(const char* filename, long n, long dim);
+/* Raw graph snapshots use only the public CAGRA C API. Graph entries are
+ * uint32 row offsets into the unchanged, row-major FP32 dataset. Export never
+ * transfers ownership of cuVS device memory. Import copies both host arrays
+ * into memory owned by cuVS or this bridge and synchronizes before returning;
+ * the caller can release both input arrays immediately afterwards. */
+int seekdb_cuvs_graph_degree(void* handle, long* graph_degree);
+int seekdb_cuvs_export_graph(void* handle, unsigned int* graph, size_t graph_elements);
+void* seekdb_cuvs_import_graph(const float* base, long n, long dim,
+                              const unsigned int* graph, long graph_degree);
 #ifdef __cplusplus
 }
-#endif
 #endif

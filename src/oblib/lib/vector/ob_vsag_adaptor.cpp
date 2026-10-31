@@ -56,6 +56,10 @@ extern "C" int   seekdb_cuvs_search(void *handle, const float *query, long nq, l
 extern "C" void  seekdb_cuvs_free(void *handle);
 extern "C" int seekdb_cuvs_serialize(void *handle, const char *filename);
 extern "C" void *seekdb_cuvs_deserialize(const char *filename, long n, long dim);
+extern "C" int seekdb_cuvs_graph_degree(void *handle, long *graph_degree);
+extern "C" int seekdb_cuvs_export_graph(void *handle, unsigned int *graph, size_t graph_elements);
+extern "C" void *seekdb_cuvs_import_graph(const float *base, long n, long dim,
+                                         const unsigned int *graph, long graph_degree);
 #else
 // GPU backend not compiled in (OB_BUILD_CUVS=OFF): inert stubs so oblib links
 // without libseekdb_cuvs_bridge.so. ob_cuvs_enabled() is false, so these are
@@ -66,6 +70,9 @@ static int   seekdb_cuvs_search(void *, const float *, long, long, unsigned int 
 static void  seekdb_cuvs_free(void *) {}
 static int seekdb_cuvs_serialize(void *, const char *) { return -1; }
 static void *seekdb_cuvs_deserialize(const char *, long, long) { return nullptr; }
+static int seekdb_cuvs_graph_degree(void *, long *) { return -1; }
+static int seekdb_cuvs_export_graph(void *, unsigned int *, size_t) { return -1; }
+static void *seekdb_cuvs_import_graph(const float *, long, long, const unsigned int *, long) { return nullptr; }
 #endif
 
 namespace oceanbase {
@@ -328,6 +335,9 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
 }
 
 static const char OB_CUVS_SNAPSHOT_MAGIC[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '2'};
+// V3 stores [VIDs][original FP32 dataset][uint32 CAGRA row-offset graph].
+// No second dataset inside a cuVS blob and no temporary file in the write path.
+static const char OB_CUVS_RAW_SNAPSHOT_MAGIC[8] = {'O', 'B', 'C', 'U', 'V', 'S', '0', '3'};
 struct ObCuvsSnapshotFile {
   FILE *file_ = ::tmpfile();
   char path_[64] = {};
@@ -363,6 +373,37 @@ static bool ob_cuvs_snapshot_big_stack(ObCuvsSnapshotJob &job) {
   return rc == 0 && pthread_join(thread, nullptr) == 0 && job.rc_ == 0;
 }
 
+struct ObCuvsRawSnapshotJob {
+  void *handle_; const float *dataset_; long n_; long dim_; long degree_;
+  std::vector<unsigned int> *graph_; bool load_; int rc_;
+};
+static void *ob_cuvs_raw_snapshot_job(void *arg) {
+  ObCuvsRawSnapshotJob *job = static_cast<ObCuvsRawSnapshotJob *>(arg);
+  if (job->load_) {
+    job->handle_ = seekdb_cuvs_import_graph(job->dataset_, job->n_, job->dim_,
+                                           job->graph_->data(), job->degree_);
+    job->rc_ = job->handle_ == nullptr ? -1 : 0;
+  } else if (seekdb_cuvs_graph_degree(job->handle_, &job->degree_) == 0 &&
+             job->degree_ > 0 && job->degree_ <= job->n_ && job->degree_ <= INT32_MAX &&
+             static_cast<uint64_t>(job->n_) <= std::numeric_limits<size_t>::max() /
+                                                 sizeof(unsigned int) / job->degree_) {
+    job->graph_->resize(static_cast<size_t>(job->n_) * job->degree_);
+    job->rc_ = seekdb_cuvs_export_graph(job->handle_, job->graph_->data(), job->graph_->size());
+  }
+  return nullptr;
+}
+static bool ob_cuvs_raw_snapshot_big_stack(ObCuvsRawSnapshotJob &job) {
+  // Only the public CAGRA calls execute on the large stack. OceanBase stream
+  // callbacks remain on their original worker with its tenant/SCN context.
+  pthread_t thread;
+  pthread_attr_t attr;
+  if (pthread_attr_init(&attr) != 0) { return false; }
+  int rc = pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+  if (rc == 0) { rc = pthread_create(&thread, &attr, ob_cuvs_raw_snapshot_job, &job); }
+  pthread_attr_destroy(&attr);
+  return rc == 0 && pthread_join(thread, nullptr) == 0 && job.rc_ == 0;
+}
+
 static bool ob_cuvs_write(std::ostream &out, const void *data, size_t bytes) {
   const char *p = static_cast<const char *>(data);
   const size_t CHUNK = 64UL * 1024 * 1024;
@@ -394,7 +435,8 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
   if (it == g_ob_cuvs_reg.end()) { return false; }
   ObCuvsEntry *ent = it->second;
   const size_t n = ent->buf_ids_.size();
-  if (n < OB_CUVS_MIN_PTS || ent->dim_ <= 0 ||
+  if (n < OB_CUVS_MIN_PTS || n > UINT32_MAX || ent->dim_ <= 0 ||
+      n > std::numeric_limits<size_t>::max() / sizeof(float) / ent->dim_ ||
       ent->buf_vecs_.size() != n * static_cast<size_t>(ent->dim_)) {
     return false;
   }
@@ -412,42 +454,32 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     ent->bridge_ = nb; ent->built_n_ = n; ent->ids_ = ent->buf_ids_;
     built = true;
   }
-  ObCuvsSnapshotFile graph;
-  ObCuvsSnapshotJob job{graph.path_, ent->bridge_.get(), static_cast<long>(n), ent->dim_, false, -1};
-  if (graph.file_ == nullptr || !ob_cuvs_snapshot_big_stack(job) ||
-      ::fseeko(graph.file_, 0, SEEK_END) != 0 || ::ftello(graph.file_) <= 0) {
+  std::vector<unsigned int> graph;
+  ObCuvsRawSnapshotJob job{ent->bridge_.get(), nullptr, static_cast<long>(n),
+                          ent->dim_, 0, &graph, false, -1};
+  if (!ob_cuvs_raw_snapshot_big_stack(job)) {
     ret = OB_ERR_VSAG_RETURN_ERROR;
     return true;
   }
-  const uint64_t graph_bytes = static_cast<uint64_t>(::ftello(graph.file_));
-  ::rewind(graph.file_);
+  const uint64_t graph_bytes = static_cast<uint64_t>(graph.size()) * sizeof(unsigned int);
   const int64_t build_us = ObTimeUtility::current_time() - start_us;
   const int32_t dim32 = ent->dim_;
-  const int32_t reserved = 0;
+  const int32_t degree32 = static_cast<int32_t>(job.degree_);
   const int64_t n64 = static_cast<int64_t>(n);
-  if (!ob_cuvs_write(out, OB_CUVS_SNAPSHOT_MAGIC, sizeof(OB_CUVS_SNAPSHOT_MAGIC)) ||
+  if (!ob_cuvs_write(out, OB_CUVS_RAW_SNAPSHOT_MAGIC, sizeof(OB_CUVS_RAW_SNAPSHOT_MAGIC)) ||
       !ob_cuvs_write(out, &graph_bytes, sizeof(graph_bytes)) ||
       !ob_cuvs_write(out, &dim32, sizeof(dim32)) ||
-      !ob_cuvs_write(out, &reserved, sizeof(reserved)) ||
+      !ob_cuvs_write(out, &degree32, sizeof(degree32)) ||
       !ob_cuvs_write(out, &n64, sizeof(n64)) ||
       !ob_cuvs_write(out, ent->buf_ids_.data(), n * sizeof(int64_t)) ||
-      !ob_cuvs_write(out, ent->buf_vecs_.data(), ent->buf_vecs_.size() * sizeof(float))) {
+      !ob_cuvs_write(out, ent->buf_vecs_.data(), ent->buf_vecs_.size() * sizeof(float)) ||
+      !ob_cuvs_write(out, graph.data(), static_cast<size_t>(graph_bytes))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[OBVSAG][cuVS] failed to write snapshot stream", K(ret), KP(key), K(n));
     return true;
   }
-  std::vector<char> chunk(65536);
-  uint64_t remaining = graph_bytes;
-  while (remaining > 0) {
-    const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
-    if (::fread(chunk.data(), 1, bytes, graph.file_) != bytes || !ob_cuvs_write(out, chunk.data(), bytes)) {
-      ret = OB_ERR_UNEXPECTED;
-      return true;
-    }
-    remaining -= bytes;
-  }
   LOG_INFO("[OBVSAG][cuVS] serialized GPU CAGRA snapshot", KP(key), K(n), K(dim32),
-           K(built), K(build_us), K(graph_bytes));
+           K(built), K(build_us), K(degree32), K(graph_bytes));
   return true;
 }
 
@@ -517,6 +549,70 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
     }
   }
   return ret;
+}
+
+// V3 consumes the same fixed-width header after its distinct magic. The degree
+// replaces V2's reserved field; graph_bytes must exactly match n*degree*4.
+static int ob_cuvs_deserialize_raw(void *key, int expected_dim, std::istream &in) {
+  int ret = OB_SUCCESS;
+  uint64_t graph_bytes = 0;
+  int32_t dim32 = 0, degree32 = 0;
+  int64_t n64 = 0;
+  if (!ob_cuvs_read(in, &graph_bytes, sizeof(graph_bytes)) ||
+      !ob_cuvs_read(in, &dim32, sizeof(dim32)) ||
+      !ob_cuvs_read(in, &degree32, sizeof(degree32)) ||
+      !ob_cuvs_read(in, &n64, sizeof(n64))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[OBVSAG][cuVS] truncated raw snapshot header", KP(key));
+    return ret;
+  }
+  if (dim32 <= 0 || dim32 != expected_dim || n64 <= 0 || n64 > UINT32_MAX ||
+      degree32 <= 0 || degree32 > n64 ||
+      static_cast<uint64_t>(n64) > std::numeric_limits<size_t>::max() / sizeof(int64_t) ||
+      static_cast<uint64_t>(n64) > std::numeric_limits<size_t>::max() / sizeof(float) / dim32 ||
+      static_cast<uint64_t>(n64) > std::numeric_limits<size_t>::max() / sizeof(unsigned int) / degree32 ||
+      graph_bytes != static_cast<uint64_t>(n64) * degree32 * sizeof(unsigned int)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[OBVSAG][cuVS] invalid raw snapshot header", KP(key), K(dim32),
+             K(expected_dim), K(n64), K(degree32), K(graph_bytes));
+    return ret;
+  }
+  const size_t n = static_cast<size_t>(n64);
+  std::unique_ptr<ObCuvsEntry> ent(new ObCuvsEntry());
+  ent->dim_ = dim32;
+  ent->buf_ids_.resize(n);
+  ent->buf_vecs_.resize(n * static_cast<size_t>(dim32));
+  std::vector<unsigned int> graph(n * static_cast<size_t>(degree32));
+  if (!ob_cuvs_read(in, ent->buf_ids_.data(), n * sizeof(int64_t)) ||
+      !ob_cuvs_read(in, ent->buf_vecs_.data(), ent->buf_vecs_.size() * sizeof(float)) ||
+      !ob_cuvs_read(in, graph.data(), static_cast<size_t>(graph_bytes))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[OBVSAG][cuVS] truncated raw snapshot payload", KP(key), K(n64));
+    return ret;
+  }
+  ObCuvsRawSnapshotJob job{nullptr, ent->buf_vecs_.data(), static_cast<long>(n),
+                          dim32, degree32, &graph, true, -1};
+  if (!ob_cuvs_raw_snapshot_big_stack(job)) {
+    ret = OB_ERR_VSAG_RETURN_ERROR;
+    LOG_WARN("[OBVSAG][cuVS] failed to import raw CAGRA graph", KP(key), K(n64));
+    return ret;
+  }
+  ent->bridge_ = ob_cuvs_wrap(job.handle_);
+  ent->built_n_ = n;
+  ent->ids_ = ent->buf_ids_;
+  {
+    std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+    ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
+    delete slot;
+    slot = ent.release();
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
+    g_ob_cuvs_marked.insert(key);
+  }
+  LOG_INFO("[OBVSAG][cuVS] deserialized GPU CAGRA snapshot", KP(key), K(n64),
+           K(dim32), K(degree32), K(graph_bytes));
+  return OB_SUCCESS;
 }
 }  // anonymous namespace
 
@@ -1950,6 +2046,10 @@ int fdeserialize(VectorIndexPtr &index_handler,
       if (got == static_cast<std::streamsize>(sizeof(magic)) &&
           0 == memcmp(magic, OB_CUVS_SNAPSHOT_MAGIC, sizeof(magic))) {
         return ob_cuvs_deserialize(index_handler, dim, in_stream);
+      }
+      if (got == static_cast<std::streamsize>(sizeof(magic)) &&
+          0 == memcmp(magic, OB_CUVS_RAW_SNAPSHOT_MAGIC, sizeof(magic))) {
+        return ob_cuvs_deserialize_raw(index_handler, dim, in_stream);
       }
       if (sb->pubseekoff(-got, std::ios_base::cur, std::ios_base::in) == std::streampos(-1)) {
         ret = OB_ERR_UNEXPECTED;

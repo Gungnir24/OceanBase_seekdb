@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <limits.h>
 #include <pthread.h>
 
 typedef struct {
@@ -26,6 +27,10 @@ typedef struct {
   size_t query_bytes, ids_bytes, distances_bytes;
   cuvsCagraSearchParams_t search;
   pthread_mutex_t search_mutex;
+  /* FromArgs may borrow device-accessible inputs even with a kDLCPU tensor.
+   * Mapped/managed host inputs are copied here; this allocation outlives idx. */
+  void* snapshot_dataset_d;
+  size_t snapshot_dataset_bytes;
 } sk_cuvs_index;
 
 static sk_cuvs_index* seekdb_cuvs_create_handle(void)
@@ -93,11 +98,11 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = NN_DESCENT;
-  h->ip->graph_degree = 128;
-  h->ip->intermediate_graph_degree = 256;
-  /* Bound graph refinement; the broader official MULTI_CTA search below
-   * preserves query quality without changing FP32 inputs or graph degree. */
-  h->ip->nn_descent_niter = 20;
+  h->ip->graph_degree = 64;
+  h->ip->intermediate_graph_degree = 128;
+  /* Bound graph refinement on a sparser graph. A broader official search
+   * compensates for fewer edges while keeping the original FP32 inputs. */
+  h->ip->nn_descent_niter = 10;
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
   h->n = n; h->dim = dim;
@@ -140,7 +145,7 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
     }
     {
       size_t required_itopk = (size_t)topk * 4;
-      if (required_itopk < 1024) required_itopk = 1024;
+      if (required_itopk < 4096) required_itopk = 4096;
       h->search->itopk_size = required_itopk;
       h->search->search_width = 4;
       h->search->algo = MULTI_CTA;
@@ -164,6 +169,7 @@ void seekdb_cuvs_free(void* handle)
   if (!h) return;
   seekdb_cuvs_release_scratch(h);
   cuvsCagraIndexDestroy(h->idx);
+  if (h->snapshot_dataset_d) cuvsRMMFree(h->res, h->snapshot_dataset_d, h->snapshot_dataset_bytes);
   cuvsCagraIndexParamsDestroy(h->ip);
   cuvsResourcesDestroy(h->res);
   pthread_mutex_destroy(&h->search_mutex);
@@ -214,6 +220,134 @@ fail:
   fprintf(stderr, "[seekdb_cuvs] deserialize failed: %s\n", cuvsGetLastErrorText());
   pthread_mutex_destroy(&index->search_mutex);
   free(index);
+  return NULL;
+}
+
+int seekdb_cuvs_graph_degree(void* handle, long* graph_degree)
+{
+  sk_cuvs_index* h = (sk_cuvs_index*)handle;
+  int64_t degree = 0;
+  if (!h || !graph_degree ||
+      cuvsCagraIndexGetGraphDegree(h->idx, &degree) != CUVS_SUCCESS ||
+      degree <= 0 || degree > h->n || degree > LONG_MAX) return 1;
+  *graph_degree = (long)degree;
+  return 0;
+}
+
+int seekdb_cuvs_export_graph(void* handle, unsigned int* graph, size_t graph_elements)
+{
+  sk_cuvs_index* h = (sk_cuvs_index*)handle;
+  DLManagedTensor view = {0};
+  cudaStream_t stream;
+  long degree = 0;
+  size_t bytes = 0;
+  int rc = 1;
+  if (!h || !graph || seekdb_cuvs_graph_degree(h, &degree) != 0 ||
+      !seekdb_cuvs_bytes(h->n, degree, sizeof(*graph), &bytes) ||
+      graph_elements != bytes / sizeof(*graph)) return 1;
+  /* Public GetGraph returns a borrowed device view and an owned metadata
+   * wrapper. Never retain its pointer or free the index's device allocation. */
+  if (cuvsCagraIndexGetGraph(h->idx, &view) != CUVS_SUCCESS) goto done;
+  {
+    const DLTensor* tensor = &view.dl_tensor;
+    if (!tensor->data || tensor->ndim != 2 || !tensor->shape ||
+        tensor->shape[0] != h->n || tensor->shape[1] != degree ||
+        tensor->dtype.code != kDLUInt || tensor->dtype.bits != 32 || tensor->dtype.lanes != 1 ||
+        (tensor->device.device_type != kDLCUDA && tensor->device.device_type != kDLROCM) ||
+        tensor->byte_offset > SIZE_MAX) goto done;
+    const int64_t row_stride = tensor->strides ? tensor->strides[0] : degree;
+    if ((tensor->strides && tensor->strides[1] != 1) || row_stride < degree ||
+        (uint64_t)row_stride > SIZE_MAX / sizeof(*graph)) goto done;
+    if (cuvsStreamGet(h->res, &stream) != CUVS_SUCCESS) goto done;
+    const char* source = (const char*)tensor->data + (size_t)tensor->byte_offset;
+    /* The official graph is contiguous. A bulk copy avoids per-row HIP
+     * staging overhead for pageable host memory; retain the strided fallback. */
+    if (row_stride == degree) {
+      if (cudaMemcpyAsync(graph, source, bytes, cudaMemcpyDefault, stream) != cudaSuccess) goto done;
+    } else if (cudaMemcpy2DAsync(graph, (size_t)degree * sizeof(*graph), source,
+                                 (size_t)row_stride * sizeof(*graph),
+                                 (size_t)degree * sizeof(*graph), (size_t)h->n,
+                                 cudaMemcpyDefault, stream) != cudaSuccess) goto done;
+    if (cuvsStreamSync(h->res) != CUVS_SUCCESS) goto done;
+    rc = 0;
+  }
+done:
+  if (view.deleter) view.deleter(&view);
+  if (rc) fprintf(stderr, "[seekdb_cuvs] graph export failed: %s\n", cuvsGetLastErrorText());
+  return rc;
+}
+
+void* seekdb_cuvs_import_graph(const float* base, long n, long dim,
+                              const unsigned int* graph, long graph_degree)
+{
+  size_t graph_bytes = 0, dataset_bytes = 0;
+  if (!base || !graph || n > UINT32_MAX || graph_degree > n ||
+      !seekdb_cuvs_bytes(n, graph_degree, sizeof(*graph), &graph_bytes) ||
+      !seekdb_cuvs_bytes(n, dim, sizeof(*base), &dataset_bytes)) return NULL;
+  /* Reject malformed persisted row offsets before they can reach a GPU
+   * traversal. The graph never stores VID values; those stay in seekdb. */
+  for (size_t i = 0; i < graph_bytes / sizeof(*graph); ++i) {
+    if (graph[i] >= (uint64_t)n) return NULL;
+  }
+  sk_cuvs_index* h = seekdb_cuvs_create_handle();
+  if (!h) return NULL;
+  if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) goto fail;
+  if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
+  if (cuvsCagraIndexCreate(&h->idx) != CUVS_SUCCESS) goto fail_ip;
+  {
+    DLManagedTensor dataset = {0}, graph_tensor = {0};
+    int64_t dataset_shape[2] = {n, dim}, graph_shape[2] = {n, graph_degree};
+    cudaPointerAttributes attributes = {0};
+    cudaStream_t stream;
+    dataset.dl_tensor.data = (void*)base;
+    dataset.dl_tensor.device.device_type = kDLCPU;
+    dataset.dl_tensor.ndim = 2;
+    dataset.dl_tensor.dtype.code = kDLFloat;
+    dataset.dl_tensor.dtype.bits = 32;
+    dataset.dl_tensor.dtype.lanes = 1;
+    dataset.dl_tensor.shape = dataset_shape;
+    graph_tensor = dataset;
+    graph_tensor.dl_tensor.data = (void*)graph;
+    graph_tensor.dl_tensor.dtype.code = kDLUInt;
+    graph_tensor.dl_tensor.shape = graph_shape;
+    /* common.hpp::make_strided_dataset may borrow any device-accessible
+     * pointer, including mapped/managed host memory tagged kDLCPU. Ordinary
+     * heap input (devicePointer == NULL) takes the original owning host-copy
+     * path. Otherwise copy into a bridge-owned device buffer, and let the
+     * fixed public device/host FromArgs instantiation borrow only OUR buffer.
+     * Host graph update_graph always makes its own device graph allocation. */
+    if (cudaPointerGetAttributes(&attributes, base) != cudaSuccess) goto fail_idx;
+    if (attributes.devicePointer != NULL) {
+      h->snapshot_dataset_bytes = dataset_bytes;
+      if (cuvsStreamGet(h->res, &stream) != CUVS_SUCCESS ||
+          cuvsRMMAlloc(h->res, &h->snapshot_dataset_d, dataset_bytes) != CUVS_SUCCESS) goto fail_idx;
+      if (cudaMemcpyAsync(h->snapshot_dataset_d, base, dataset_bytes,
+                          cudaMemcpyDefault, stream) != cudaSuccess) goto fail_idx;
+      dataset.dl_tensor.data = h->snapshot_dataset_d;
+      dataset.dl_tensor.device.device_type = kDLCUDA;
+    }
+    if (cuvsCagraIndexFromArgs(h->res, L2Expanded, &graph_tensor, &dataset, h->idx) != CUVS_SUCCESS ||
+        cuvsStreamSync(h->res) != CUVS_SUCCESS) goto fail_idx;
+  }
+  {
+    int64_t actual_n = 0, actual_dim = 0, actual_degree = 0;
+    if (cuvsCagraIndexGetSize(h->idx, &actual_n) != CUVS_SUCCESS || actual_n != n ||
+        cuvsCagraIndexGetDims(h->idx, &actual_dim) != CUVS_SUCCESS || actual_dim != dim ||
+        cuvsCagraIndexGetGraphDegree(h->idx, &actual_degree) != CUVS_SUCCESS ||
+        actual_degree != graph_degree) goto fail_idx;
+  }
+  h->n = n;
+  h->dim = dim;
+  return h;
+fail_idx:
+  cuvsCagraIndexDestroy(h->idx);
+  if (h->snapshot_dataset_d) cuvsRMMFree(h->res, h->snapshot_dataset_d, h->snapshot_dataset_bytes);
+fail_ip: cuvsCagraIndexParamsDestroy(h->ip);
+fail_res: cuvsResourcesDestroy(h->res);
+fail:
+  fprintf(stderr, "[seekdb_cuvs] graph import failed: %s\n", cuvsGetLastErrorText());
+  pthread_mutex_destroy(&h->search_mutex);
+  free(h);
   return NULL;
 }
 
