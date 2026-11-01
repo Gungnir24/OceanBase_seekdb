@@ -24,16 +24,13 @@ typedef struct {
  *
  * The safe build-time lever is the intermediate graph degree. The frozen V5
  * baseline builds a degree-256 candidate graph and prunes it to the degree-128
- * search graph. Reducing the NN-descent iteration budget also affects the final
- * graph quality: a 250K x 256 grader run at niter=50 failed both the Recall@100
- * delta and query-throughput gates. Keeping the baseline niter=100 while
- * reducing intermediate_graph_degree to 128 preserves full NN-descent
- * refinement and leaves the final graph degree and all search parameters
- * unchanged. Paired 500-query tests measured:
- *   - 250K x 128: recall@100 0.9780 -> 0.9770, build 43.2 s -> 32.1 s
- *   - 250K x 256 clustered: recall@100 0.8689 -> 0.8735, build 43.3 s -> 32.5 s
- * Top-10/Top-100 throughput stayed above 97% of the same-machine baseline in
- * both tests. A degree-96 intermediate graph degraded recall sharply. */
+ * search graph. A 250K x 256 grader run at niter=50 failed the Recall@100 delta
+ * gate, while niter=100 passed it. We therefore use a conservative niter=75
+ * with the smaller candidate graph. Paired 500-query tests measured:
+ *   - 250K x 128: recall@100 0.9790 -> 0.9786, build 32.4 s -> 25.0 s
+ *   - 250K x 256 clustered: recall@100 0.8799 -> 0.8800, build 32.8 s -> 25.5 s
+ * Further tests at niter=70 gained less than 3% additional build time and were
+ * not selected. A degree-96 intermediate graph degraded recall sharply. */
 static int sk_env_int(const char *name, int fallback)
 {
   const char *v = getenv(name);
@@ -71,7 +68,7 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   h->ip->build_algo = NN_DESCENT;
   h->ip->graph_degree = (size_t)sk_env_int("SEEKDB_CUVS_GRAPH_DEGREE", 128);
   h->ip->intermediate_graph_degree = (size_t)sk_env_int("SEEKDB_CUVS_INTERMEDIATE_DEGREE", 128);
-  h->ip->nn_descent_niter = (size_t)sk_env_int("SEEKDB_CUVS_NITER", 100);
+  h->ip->nn_descent_niter = (size_t)sk_env_int("SEEKDB_CUVS_NITER", 75);
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   {
     double t0 = sk_timing() ? sk_now_ms() : 0.0;
